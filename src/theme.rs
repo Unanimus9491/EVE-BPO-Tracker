@@ -12,6 +12,7 @@ pub const BORDER: Color32 = Color32::from_rgb(0x34, 0x30, 0x2d);
 pub const TEXT: Color32 = Color32::from_rgb(0xec, 0xe6, 0xdc);
 pub const MUTED: Color32 = Color32::from_rgb(0x9a, 0x92, 0x8a);
 pub const MISSING: Color32 = Color32::from_rgb(0x8f, 0x85, 0x7c);
+pub const MISSING_WARN: Color32 = Color32::from_rgb(0xc9, 0x7a, 0x6a);
 pub const SELECT: Color32 = Color32::from_rgb(0xd8, 0xd2, 0xc8);
 
 pub const CARD_OWNED: Color32 = Color32::from_rgb(0x2a, 0x26, 0x21);

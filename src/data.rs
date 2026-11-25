@@ -182,6 +182,9 @@ pub struct State {
     pub ignored: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub notes: String,
+    /// Owned/qty/ME/TE came from an EVE character sync (and will be updated by the next one).
+    #[serde(skip_serializing_if = "is_false")]
+    pub synced: bool,
 }
 fn is_false(b: &bool) -> bool {
     !*b
@@ -274,6 +277,7 @@ impl Collection {
         if !s.owned {
             s.me = 0;
             s.te = 0;
+            s.synced = false;
         }
         s.me = s.me.min(ME_MAX);
         s.te = s.te.min(TE_MAX);
@@ -284,6 +288,45 @@ impl Collection {
         }
         self.revision += 1;
         self.dirty_since.get_or_insert_with(Instant::now);
+    }
+
+    /// Apply blueprint originals read from EVE. Synced data wins for what EVE reports;
+    /// anything a previous sync marked owned that's no longer there is marked missing.
+    /// Manually ticked blueprints, favourites, notes and ignores are left alone.
+    /// Returns (newly owned, updated, no longer owned).
+    pub fn apply_sync(&mut self, owned: &HashMap<u32, crate::esi::Owned>) -> (usize, usize, usize) {
+        let (mut added, mut changed, mut removed) = (0, 0, 0);
+        for (id, o) in owned {
+            let old = self.get(*id).clone();
+            let mut s = old.clone();
+            s.owned = true;
+            s.qty = o.qty.max(1);
+            s.me = o.me.min(ME_MAX);
+            s.te = o.te.min(TE_MAX);
+            s.synced = true;
+            if s != old {
+                if old.owned { changed += 1 } else { added += 1 }
+                self.states.insert(*id, s);
+            }
+        }
+        let gone: Vec<u32> =
+            self.states.iter().filter(|(id, s)| s.synced && !owned.contains_key(id)).map(|(id, _)| *id).collect();
+        for id in gone {
+            if let Some(s) = self.states.get_mut(&id) {
+                s.owned = false;
+                s.qty = 0;
+                s.me = 0;
+                s.te = 0;
+                s.synced = false;
+                removed += 1;
+                if *s == State::default() {
+                    self.states.remove(&id);
+                }
+            }
+        }
+        self.revision += 1;
+        self.dirty_since.get_or_insert_with(Instant::now);
+        (added, changed, removed)
     }
 
     pub fn replace_all(&mut self, states: BTreeMap<u32, State>) {
@@ -621,6 +664,30 @@ mod tests {
         c.save();
         let text = fs::read_to_string(dir.join("c.json")).unwrap();
         assert!(text.contains("\"2\"") && !text.contains("notes"));
+    }
+
+    #[test]
+    fn sync_rules() {
+        use crate::esi::Owned;
+        let dir = std::env::temp_dir().join("bpo-test-sync");
+        let _ = fs::create_dir_all(&dir);
+        let _ = fs::remove_file(dir.join("c.json"));
+        let mut c = Collection::load(dir.join("c.json"));
+        c.edit(1, Edit::Owned(true)); // ticked by hand
+        c.edit(2, Edit::Fav(true));
+        c.edit(2, Edit::Notes("keep".into()));
+        let mut owned = HashMap::new();
+        owned.insert(2, Owned { qty: 2, me: 10, te: 20 });
+        owned.insert(3, Owned { qty: 1, me: 5, te: 0 });
+        assert_eq!(c.apply_sync(&owned), (2, 0, 0));
+        assert!(c.get(1).owned && !c.get(1).synced, "manual ticks untouched");
+        assert!(c.get(2).fully_researched() && c.get(2).fav && c.get(2).notes == "keep");
+        owned.remove(&3);
+        owned.insert(2, Owned { qty: 1, me: 10, te: 20 });
+        assert_eq!(c.apply_sync(&owned), (0, 1, 1));
+        assert!(!c.get(3).owned, "sold/moved blueprints drop out");
+        assert!(c.get(1).owned, "still untouched");
+        assert_eq!(c.apply_sync(&owned), (0, 0, 0));
     }
 
     #[test]

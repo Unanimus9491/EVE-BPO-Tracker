@@ -1,6 +1,8 @@
 //! The tracker window: tabs, filters, a virtualised card grid with group headers, and a detail panel.
 
 use crate::data::{self, Collection, Edit, Entry, ME_MAX, Progress, TABS, TE_MAX};
+use crate::esi::{self, Account, SyncedOriginal};
+use std::collections::HashMap;
 use crate::icons::Icons;
 use crate::theme::*;
 use eframe::egui::{
@@ -62,6 +64,8 @@ struct Filters {
     /// Tech II BPOs essentially can't be obtained (only from rare events or dev gifts),
     /// and Tech III only comes as reverse-engineered copies.
     hide_t2_t3: bool,
+    /// Characters whose synced blueprints are shown; None = everything (all characters + hand-ticked).
+    chars: Option<BTreeSet<String>>,
 }
 
 pub struct TrackerApp {
@@ -84,6 +88,16 @@ pub struct TrackerApp {
     build: Option<Progress>,
     dialog: Dialog,
     test: Option<TestHook>,
+    // EVE character sync
+    accounts: Vec<Account>,
+    details: HashMap<u32, Vec<SyncedOriginal>>,
+    login: Option<esi::Login>,
+    sync: Option<esi::Sync>,
+    sync_manual: bool,
+    sync_status: String,
+    sync_failed: bool,
+    started_sync: bool,
+    ctx: Option<egui::Context>,
 }
 
 /// For automated screenshots: BPO_SCREENSHOT=out.png [BPO_TEST_TAB=1] [BPO_TEST_SORT=1] [BPO_TEST_SELECT=id]
@@ -115,6 +129,7 @@ impl TrackerApp {
                 sort: SORT_GROUP,
                 hide_ignored: true,
                 hide_t2_t3: true,
+                chars: None,
             },
             applied: None,
             collapsed: BTreeSet::new(),
@@ -128,7 +143,18 @@ impl TrackerApp {
             notes: (0, String::new()),
             build: None,
             test: None,
+            accounts: Vec::new(),
+            details: HashMap::new(),
+            login: None,
+            sync: None,
+            sync_manual: false,
+            sync_status: String::new(),
+            sync_failed: false,
+            started_sync: false,
+            ctx: None,
         };
+        app.accounts = esi::load_accounts(&esi::accounts_path(&app.dir));
+        app.details = esi::load_details(&esi::details_path(&app.dir));
         app.load_settings();
         if let Some(out) = std::env::var_os("BPO_SCREENSHOT") {
             let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
@@ -138,6 +164,9 @@ impl TrackerApp {
             app.f.status = num("BPO_TEST_STATUS").unwrap_or(0);
             app.selected = num("BPO_TEST_SELECT").map(|v| v as u32);
             app.f.search = std::env::var("BPO_TEST_SEARCH").unwrap_or_default();
+            if let Ok(c) = std::env::var("BPO_TEST_CHARS") {
+                app.f.chars = Some(c.split(',').map(str::to_string).collect());
+            }
             if let Ok(g) = std::env::var("BPO_TEST_COLLAPSE") {
                 app.collapsed.insert(("Ship".into(), g));
             }
@@ -145,6 +174,154 @@ impl TrackerApp {
         }
         app.refresh_options();
         app
+    }
+
+    // ------------------------------------------------------------------ EVE login + sync
+    fn start_login(&mut self, ctx: &egui::Context) {
+        if self.login.is_none() {
+            self.login = Some(esi::start_login(ctx.clone()));
+        }
+    }
+
+    fn start_sync(&mut self, manual: bool) {
+        if self.sync.is_some() || self.accounts.is_empty() {
+            return;
+        }
+        if let Some(ctx) = &self.ctx {
+            self.sync = Some(esi::start_sync(self.accounts.clone(), ctx.clone()));
+            self.sync_manual = manual;
+            self.sync_status = "Syncing with EVE…".into();
+            self.sync_failed = false;
+        }
+    }
+
+    fn poll_esi(&mut self) {
+        let login_result = self.login.as_ref().and_then(|l| l.state.lock().ok().and_then(|mut g| g.result.take()));
+        if let Some(result) = login_result {
+            self.login = None;
+            match result {
+                Ok(acc) => {
+                    self.accounts.retain(|a| a.character_id != acc.character_id);
+                    self.accounts.push(acc);
+                    self.accounts.sort_by_key(|a| a.name.to_lowercase());
+                    esi::save_accounts(&esi::accounts_path(&self.dir), &self.accounts);
+                    self.start_sync(true);
+                }
+                Err(e) => {
+                    self.dialog = Dialog::Message { title: "EVE login didn't complete".into(), body: e };
+                }
+            }
+        }
+        let sync_result = self.sync.as_ref().and_then(|s| s.result.lock().ok().and_then(|mut g| g.take()));
+        if let Some(r) = sync_result {
+            self.sync = None;
+            // Keep accounts' rotated tokens, but don't resurrect characters removed mid-sync.
+            for updated in r.accounts {
+                if let Some(a) = self.accounts.iter_mut().find(|a| a.character_id == updated.character_id) {
+                    *a = updated;
+                }
+            }
+            esi::save_accounts(&esi::accounts_path(&self.dir), &self.accounts);
+            if r.synced.is_empty() {
+                self.sync_failed = true;
+                self.sync_status = "Sync failed".into();
+            } else {
+                // Only apply when every character synced, so a temporary error can't
+                // mark another character's blueprints as missing.
+                if r.errors.is_empty() {
+                    let (added, changed, removed) = self.coll.apply_sync(&r.owned);
+                    self.details = r.details;
+                    esi::save_details(&esi::details_path(&self.dir), &self.details);
+                    self.coll.save();
+                    self.refilter_if_needed(true);
+                    let mut parts = vec![format!("{added} new"), format!("{changed} updated")];
+                    if removed > 0 {
+                        parts.push(format!("{removed} no longer owned"));
+                    }
+                    self.sync_status = format!("Synced {} · {}", now_hhmm(), parts.join(", "));
+                } else {
+                    self.sync_failed = true;
+                    self.sync_status = "Sync incomplete, nothing changed".into();
+                }
+            }
+            if !r.errors.is_empty() && (self.sync_manual || self.accounts.iter().any(|a| a.needs_login)) {
+                self.dialog = Dialog::Message { title: "EVE sync problems".into(), body: r.errors.join("\n") };
+            } else if !r.errors.is_empty() {
+                self.sync_status += &format!(" ({})", r.errors.join("; "));
+            }
+        }
+    }
+
+    /// "All characters" or a chosen subset; doesn't touch logins.
+    fn character_picker(&mut self, ui: &mut Ui) {
+        let all: BTreeSet<String> = self.accounts.iter().map(|a| a.name.clone()).collect();
+        let label = match &self.f.chars {
+            None => "All characters".to_string(),
+            Some(c) if c.len() == 1 => c.iter().next().cloned().unwrap_or_default(),
+            Some(c) => format!("{} characters", c.len()),
+        };
+        egui::ComboBox::from_id_salt("chars").width(170.0).selected_text(label).show_ui(ui, |ui| {
+            if ui.selectable_label(self.f.chars.is_none(), "All characters").clicked() {
+                self.f.chars = None;
+            }
+            ui.separator();
+            let mut set = self.f.chars.clone().unwrap_or_else(|| all.clone());
+            let mut changed = false;
+            for name in &all {
+                let mut on = set.contains(name);
+                if ui.checkbox(&mut on, name).changed() {
+                    changed = true;
+                    if on {
+                        set.insert(name.clone());
+                    } else {
+                        set.remove(name);
+                    }
+                }
+            }
+            if changed {
+                self.f.chars = if set.is_empty() || set == all { None } else { Some(set) };
+            }
+        })
+        .response
+        .on_hover_text("Show the blueprints of some characters only. Hand-ticked blueprints appear under All characters.");
+    }
+
+    fn characters_menu(&mut self, ui: &mut Ui) {
+        if ui.button("Log in with EVE (add character)…").clicked() {
+            self.start_login(ui.ctx());
+            ui.close();
+        }
+        let can_sync = !self.accounts.is_empty() && self.sync.is_none();
+        if ui.add_enabled(can_sync, egui::Button::new("Sync now")).clicked() {
+            self.start_sync(true);
+            ui.close();
+        }
+        if !self.accounts.is_empty() {
+            ui.separator();
+        }
+        let mut remove = None;
+        let mut relogin = false;
+        for a in &self.accounts {
+            ui.menu_button(if a.needs_login { format!("{}  (log in again)", a.name) } else { a.name.clone() }, |ui| {
+                if a.needs_login && ui.button("Log in again…").clicked() {
+                    relogin = true;
+                    ui.close();
+                }
+                if ui.button("Remove this character").clicked() {
+                    remove = Some(a.character_id);
+                    ui.close();
+                }
+            });
+        }
+        if relogin {
+            self.start_login(ui.ctx());
+        }
+        if let Some(id) = remove {
+            self.accounts.retain(|a| a.character_id != id);
+            esi::save_accounts(&esi::accounts_path(&self.dir), &self.accounts);
+            self.f.chars = None;
+            self.sync_status = "Character removed. Sync to update owned blueprints.".into();
+        }
     }
 
     fn load_settings(&mut self) {
@@ -230,7 +407,7 @@ impl TrackerApp {
         if self.hides_tech(e) {
             return false;
         }
-        let s = self.coll.get(e.id);
+        let s = &self.view_state(e.id);
         if f.hide_ignored && s.ignored && f.status != 7 {
             return false;
         }
@@ -267,7 +444,7 @@ impl TrackerApp {
             }),
             2 | 3 => {
                 let missing_first = self.f.sort == 2;
-                idx.sort_by_cached_key(|i| (self.coll.get(self.entries[*i].id).owned == missing_first, key(i)))
+                idx.sort_by_cached_key(|i| (self.view_state(self.entries[*i].id).owned == missing_first, key(i)))
             }
             _ => idx.sort_by_cached_key(key),
         }
@@ -422,7 +599,32 @@ impl TrackerApp {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             });
+            ui.menu_button("Characters", |ui| self.characters_menu(ui));
         });
+    }
+
+    /// What a card shows. With a character view active, ownership and ME/TE come only from
+    /// those characters' synced originals; favourites, notes and ignores are kept.
+    fn view_state(&self, id: u32) -> data::State {
+        let mut s = self.coll.get(id).clone();
+        let Some(chars) = &self.f.chars else { return s };
+        let mut qty = 0;
+        let (mut me, mut te) = (0, 0);
+        for d in self.details.get(&id).into_iter().flatten().filter(|d| chars.contains(&d.character)) {
+            qty += d.count;
+            me = me.max(d.me);
+            te = te.max(d.te);
+        }
+        s.owned = qty > 0;
+        s.qty = qty;
+        s.me = me;
+        s.te = te;
+        s.synced = s.owned;
+        s
+    }
+
+    fn character_view_active(&self) -> bool {
+        self.f.chars.is_some()
     }
 
     /// Hidden as Tech II/III, unless the tech filter explicitly asks for that tech level.
@@ -441,7 +643,7 @@ impl TrackerApp {
             _ => true,
         };
         for e in self.entries.iter().filter(|e| self.in_tab(e) && market_ok(e) && !self.hides_tech(e)) {
-            let s = self.coll.get(e.id);
+            let s = self.view_state(e.id);
             if s.ignored {
                 continue;
             }
@@ -465,6 +667,29 @@ impl TrackerApp {
             ui.label(RichText::new(format!("/ {counted} owned ({pct:.1}%)")).color(MUTED));
             ui.label(RichText::new("·").color(MUTED));
             ui.label(RichText::new(format!("{full} fully researched")).color(GOLD));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if self.accounts.is_empty() {
+                    if ui.button("Log in with EVE").on_hover_text("Fill in your collection from your characters' blueprints").clicked() {
+                        self.start_login(ui.ctx());
+                    }
+                } else {
+                    let names: Vec<_> = self.accounts.iter().map(|a| a.name.as_str()).collect();
+                    let sync_btn = ui
+                        .add_enabled(self.sync.is_none(), egui::Button::new("Sync"))
+                        .on_hover_text(format!("Read blueprints from: {}", names.join(", ")));
+                    if sync_btn.clicked() {
+                        self.start_sync(true);
+                    }
+                    if self.sync.is_some() {
+                        ui.spinner();
+                    }
+                    let color = if self.sync_failed { MISSING_WARN } else { MUTED };
+                    ui.label(RichText::new(&self.sync_status).color(color));
+                    if self.accounts.len() > 1 {
+                        self.character_picker(ui);
+                    }
+                }
+            });
         });
         ui.add_space(4.0);
 
@@ -605,8 +830,9 @@ impl TrackerApp {
             .on_hover_cursor(CursorIcon::PointingHand)
             .on_hover_text(if collapsed { "Click to expand" } else { "Click to collapse" });
         let p = ui.painter();
-        let owned = ids.iter().filter(|i| self.coll.get(**i).owned).count();
-        let full = ids.iter().filter(|i| self.coll.get(**i).fully_researched()).count();
+        let states: Vec<_> = ids.iter().map(|i| self.view_state(*i)).collect();
+        let owned = states.iter().filter(|s| s.owned).count();
+        let full = states.iter().filter(|s| s.fully_researched()).count();
         let complete = !ids.is_empty() && owned == ids.len();
         let mid = r.top() + 27.0;
         // chevron: points right when collapsed, down when open
@@ -683,9 +909,10 @@ impl TrackerApp {
     fn card(&mut self, ui: &mut Ui, rect: Rect, ei: usize, shift: bool, edits: &mut Vec<(u32, Edit)>, select: &mut Option<u32>) {
         let e = &self.entries[ei];
         let id = e.id;
-        let s = self.coll.get(id).clone();
+        let s = self.view_state(id);
         let researched = s.fully_researched();
         let selected = self.selected == Some(id);
+        let can_edit = !self.character_view_active();
 
         let base = ui.scope_id().with(("card", id));
         let card_resp = ui.interact(rect, base, Sense::click());
@@ -696,13 +923,19 @@ impl TrackerApp {
         let bpo_r = Rect::from_min_size(pos2(sx, y + 50.0), Vec2::splat(SLOT_SIZE));
         let me_r = Rect::from_min_size(pos2(sx + SLOT_SIZE + 8.0, y + 50.0), Vec2::splat(SLOT_SIZE));
         let te_r = Rect::from_min_size(pos2(sx + 2.0 * (SLOT_SIZE + 8.0), y + 50.0), Vec2::splat(SLOT_SIZE));
-        let research_ok = e.researchable && s.owned;
+        let research_ok = e.researchable && s.owned && can_edit;
 
         let star = ui.interact(star_r, base.with("star"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
         let bpo = ui
             .interact(bpo_r, base.with("bpo"), Sense::click())
-            .on_hover_cursor(CursorIcon::PointingHand)
-            .on_hover_text(if s.owned { "Click: mark missing" } else { "Click: mark owned" });
+            .on_hover_cursor(if can_edit { CursorIcon::PointingHand } else { CursorIcon::Default })
+            .on_hover_text(if !can_edit {
+                "Switch to All characters to edit"
+            } else if s.owned {
+                "Click: mark missing"
+            } else {
+                "Click: mark owned"
+            });
         let (me, te) = if e.researchable {
             let me = ui.interact(me_r, base.with("me"), Sense::click());
             let te = ui.interact(te_r, base.with("te"), Sense::click());
@@ -721,7 +954,7 @@ impl TrackerApp {
         if star.clicked() {
             edits.push((id, Edit::Fav(!s.fav)));
         }
-        if bpo.clicked() {
+        if bpo.clicked() && can_edit {
             edits.push((id, Edit::Owned(!s.owned)));
         }
         if research_ok {
@@ -809,8 +1042,12 @@ impl TrackerApp {
         p.text(pos2(rect.right() - 12.0, fy), Align2::RIGHT_CENTER, text, font_bold(12.5), color);
         let kind = if e.tab == "Other" { e.category.clone() } else { e.tab.trim_end_matches('s').to_string() };
         let k = p.text(pos2(x + 12.0, fy), Align2::LEFT_CENTER, kind, font(11.5), MUTED);
+        let mut fx = k.right() + 12.0;
+        if s.synced {
+            fx = p.text(pos2(fx, fy), Align2::LEFT_CENTER, "• EVE", font(11.5), MUTED).right() + 10.0;
+        }
         if !s.notes.is_empty() {
-            p.text(pos2(k.right() + 12.0, fy), Align2::LEFT_CENTER, "• note", font(11.5), MUTED);
+            p.text(pos2(fx, fy), Align2::LEFT_CENTER, "• note", font(11.5), MUTED);
         }
 
         // context menu
@@ -823,16 +1060,18 @@ impl TrackerApp {
                     ui.close();
                 }
             };
-            push(ui, if s.owned { "Mark missing" } else { "Mark owned" }, Edit::Owned(!s.owned));
-            push(ui, "Add another copy (qty +1)", Edit::Qty(s.qty + 1));
-            if s.qty > 1 {
-                push(ui, "Remove a copy (qty −1)", Edit::Qty(s.qty - 1));
+            if can_edit {
+                push(ui, if s.owned { "Mark missing" } else { "Mark owned" }, Edit::Owned(!s.owned));
+                push(ui, "Add another copy (qty +1)", Edit::Qty(s.qty + 1));
+                if s.qty > 1 {
+                    push(ui, "Remove a copy (qty −1)", Edit::Qty(s.qty - 1));
+                }
+                if s.owned && researchable {
+                    push(ui, "Set fully researched (ME 10 / TE 20)", Edit::MaxResearch);
+                    push(ui, "Reset research", Edit::ResetResearch);
+                }
+                ui.separator();
             }
-            if s.owned && researchable {
-                push(ui, "Set fully researched (ME 10 / TE 20)", Edit::MaxResearch);
-                push(ui, "Reset research", Edit::ResetResearch);
-            }
-            ui.separator();
             push(ui, if s.fav { "Unfavourite" } else { "Favourite" }, Edit::Fav(!s.fav));
             push(ui, if s.ignored { "Un-ignore" } else { "Ignore (not part of my collection)" }, Edit::Ignored(!s.ignored));
             ui.separator();
@@ -851,7 +1090,8 @@ impl TrackerApp {
             ui.label(RichText::new("Click a card to edit it here.").color(MUTED));
             return;
         };
-        let s = self.coll.get(e.id).clone();
+        let s = self.view_state(e.id);
+        let can_edit = !self.character_view_active();
         if self.notes.0 != e.id {
             self.notes = (e.id, s.notes.clone());
         }
@@ -878,6 +1118,61 @@ impl TrackerApp {
         ui.label(RichText::new(info).color(MUTED));
         ui.add_space(10.0);
 
+        let list: Vec<SyncedOriginal> = self
+            .details
+            .get(&e.id)
+            .filter(|_| s.synced)
+            .map(|l| {
+                l.iter().filter(|d| self.f.chars.as_ref().is_none_or(|c| c.contains(&d.character))).cloned().collect()
+            })
+            .unwrap_or_default();
+        if !list.is_empty() {
+            let total: u32 = list.iter().map(|d| d.count).sum();
+            ui.label(RichText::new(format!("In EVE: {total} original{}", if total == 1 { "" } else { "s" })).font(font_bold(14.0)));
+            egui::Frame::new().fill(GROUND).corner_radius(6).inner_margin(8).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                egui::Grid::new("originals").num_columns(3).spacing([10.0, 4.0]).show(ui, |ui| {
+                    for (i, d) in list.iter().enumerate() {
+                        let best = i == 0;
+                        let c = if best { GOLD_PALE } else { TEXT };
+                        ui.label(RichText::new(&d.character).color(c));
+                        ui.label(RichText::new(format!("ME {} / TE {}", d.me, d.te)).color(c));
+                        ui.label(RichText::new(if d.count > 1 { format!("×{}", d.count) } else { String::new() }).color(MUTED));
+                        ui.end_row();
+                    }
+                });
+            });
+            ui.label(RichText::new("The card shows the best-researched one. Changes below are replaced on the next sync.").color(MUTED).font(font(11.5)));
+            ui.add_space(8.0);
+        }
+        if !can_edit {
+            ui.label(RichText::new("Showing selected characters only. Switch to All characters to edit ownership and research.").color(MUTED).font(font(11.5)));
+            ui.add_space(4.0);
+        }
+        ui.add_enabled_ui(can_edit, |ui| self.ownership_controls(ui, &e, &s));
+        ui.add_space(4.0);
+        let mut fav = s.fav;
+        if ui.checkbox(&mut fav, "Favourite").changed() {
+            self.coll.edit(e.id, Edit::Fav(fav));
+        }
+        let mut ignored = s.ignored;
+        if ui.checkbox(&mut ignored, "Ignore (exclude from collection)").changed() {
+            self.coll.edit(e.id, Edit::Ignored(ignored));
+        }
+        ui.add_space(8.0);
+        ui.label("Notes");
+        let resp = ui.add(
+            egui::TextEdit::multiline(&mut self.notes.1)
+                .hint_text("Where it is, what you paid, plans…")
+                .desired_width(f32::INFINITY)
+                .desired_rows(8),
+        );
+        if resp.changed() {
+            self.coll.edit(e.id, Edit::Notes(self.notes.1.clone()));
+        }
+    }
+
+    fn ownership_controls(&mut self, ui: &mut Ui, e: &Entry, s: &data::State) {
         let mut owned = s.owned;
         if ui.checkbox(&mut owned, "Owned").changed() {
             self.coll.edit(e.id, Edit::Owned(owned));
@@ -907,30 +1202,43 @@ impl TrackerApp {
         {
             self.coll.edit(e.id, Edit::MaxResearch);
         }
-        ui.add_space(4.0);
-        let mut fav = s.fav;
-        if ui.checkbox(&mut fav, "Favourite").changed() {
-            self.coll.edit(e.id, Edit::Fav(fav));
-        }
-        let mut ignored = s.ignored;
-        if ui.checkbox(&mut ignored, "Ignore (exclude from collection)").changed() {
-            self.coll.edit(e.id, Edit::Ignored(ignored));
-        }
-        ui.add_space(8.0);
-        ui.label("Notes");
-        let resp = ui.add(
-            egui::TextEdit::multiline(&mut self.notes.1)
-                .hint_text("Where it is, what you paid, plans…")
-                .desired_width(f32::INFINITY)
-                .desired_rows(8),
-        );
-        if resp.changed() {
-            self.coll.edit(e.id, Edit::Notes(self.notes.1.clone()));
-        }
     }
 
     // ------------------------------------------------------------------ dialogs
     fn dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(login) = &self.login {
+            let url = login.state.lock().map(|g| g.url.clone()).unwrap_or_default();
+            let mut cancel = false;
+            egui::Modal::new(egui::Id::unique("login")).show(ctx, |ui| {
+                ui.set_width(440.0);
+                ui.label(RichText::new("Log in with EVE").font(font_bold(17.0)));
+                ui.add_space(6.0);
+                ui.label(
+                    "Your browser should have opened EVE's login page. Pick a character and approve access \
+                     to its blueprints, then come back here.",
+                );
+                ui.label(RichText::new("The tracker only asks to read blueprints. It can't see or change anything else.").color(MUTED));
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    if ui.button("Open the page again").clicked() {
+                        esi::open_in_browser(&url);
+                    }
+                    if ui.button("Copy link").clicked() {
+                        ui.ctx().copy_text(url.clone());
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+            if cancel {
+                login.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.login = None;
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            return;
+        }
         if let Some(p) = &self.build {
             let (msg, done, total) = p.lock().map(|g| (g.message.clone(), g.done, g.total)).unwrap_or_default();
             egui::Modal::new(egui::Id::unique("build")).show(ctx, |ui| {
@@ -1048,6 +1356,10 @@ impl TrackerApp {
     fn test_hook(&mut self, ctx: &egui::Context) {
         let Some(t) = &mut self.test else { return };
         t.frame += 1;
+        if t.frame == 1 && std::env::var_os("BPO_TEST_LOGIN").is_some() {
+            self.start_login(ctx);
+        }
+        let Some(t) = &mut self.test else { return };
         if t.frame == 8 {
             let out = t.out.clone();
             let done = t.done.clone();
@@ -1073,7 +1385,13 @@ impl eframe::App for TrackerApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.icons.poll(&ctx);
+        self.ctx.get_or_insert_with(|| ctx.clone());
+        if !self.started_sync && self.test.is_none() && !self.accounts.is_empty() && !self.entries.is_empty() {
+            self.started_sync = true;
+            self.start_sync(false); // pick up changes since last time
+        }
         self.poll_build();
+        self.poll_esi();
         self.refilter_if_needed(false);
 
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
@@ -1150,4 +1468,10 @@ fn elide(p: &egui::Painter, text: &str, font: egui::FontId, max_w: f32) -> Strin
         if w(&s) <= max_w { lo = mid } else { hi = mid - 1 }
     }
     chars[..lo].iter().collect::<String>().trim_end().to_string() + "…"
+}
+
+fn now_hhmm() -> String {
+    // Local time isn't in std; UTC matches EVE time, which players know well.
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    format!("{:02}:{:02} EVE", (secs / 3600) % 24, (secs / 60) % 60)
 }

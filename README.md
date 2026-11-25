@@ -42,9 +42,31 @@ hand-made list in `src/data.rs` (`SHIP_TREE_ORDER`), because the game data doesn
 **Ignore** removes a blueprint from your completion count, for example BPC-only items
 you don't count as part of the set.
 
+## Syncing from EVE
+**Characters › Log in with EVE** (or the button at the top right) opens EVE's official login page
+in your browser. Pick a character and approve access. The tracker only asks to read blueprints.
+After that it fills in your collection automatically: on start-up, and whenever you click **Sync**.
+Add more characters the same way and their blueprints are combined.
+
+- With two or more characters, a picker next to **Sync** shows **All characters** or just the ones you
+  tick, without logging anyone out. Cards, totals and group headers then count only those characters'
+  originals. Hand-ticked blueprints only appear under All characters, and ownership edits are made there.
+- Only **originals** count. Copies are ignored.
+- If you own several originals of one blueprint, the card shows the total and the **best** ME/TE.
+  The side panel lists every original with its character and ME/TE.
+- EVE refreshes blueprint data about once an hour, so a sync can lag slightly behind the game.
+- Sync wins for anything EVE reports. Blueprints a previous sync marked as owned are marked missing
+  once they're gone. Anything you ticked by hand, plus favourites, notes and ignores, is left alone.
+- If any character fails to sync, nothing is changed, so a hiccup can't wipe blueprints.
+
+The login uses EVE's PKCE flow for desktop apps, so no secret is stored in the app.
+Login tokens are kept in `accounts.json` in your data folder. Remove a character via the
+Characters menu, or revoke access at any time from the third-party applications page of your EVE account.
+
 ## Your data
 Saved automatically in `%APPDATA%\EVE BPO Tracker\`: `collection.json` (your progress), `bpos.json`
-(blueprint list), `settings.json` (collapsed groups) and `icons\` (image cache from images.evetech.net). This is the same folder and
+(blueprint list), `settings.json` (collapsed groups), `accounts.json` and `sync_details.json`
+(EVE logins and synced originals) and `icons\` (image cache from images.evetech.net). This is the same folder and
 format the earlier Python version used, so existing progress carries over.
 Use *File › Back up collection* occasionally. *Export to CSV* gives you a spreadsheet.
 
@@ -56,6 +78,7 @@ Use *File › Back up collection* occasionally. *Export to CSV* gives you a spre
 
 ## Project layout
 - `src/data.rs`: blueprint list builder, collection state, CSV export
+- `src/esi.rs`: EVE login (SSO with PKCE) and blueprint sync
 - `src/icons.rs`: background image loading and disk cache
 - `src/app.rs`: the window (tabs, filters, card grid, detail panel)
 - `src/theme.rs`: Solus colours and fonts

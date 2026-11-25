@@ -3,6 +3,7 @@
 
 mod app;
 mod data;
+mod esi;
 mod icons;
 mod theme;
 
