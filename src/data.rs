@@ -38,6 +38,45 @@ pub fn tab_for(kind: &str, category: &str) -> &'static str {
     }
 }
 
+/// Ship groups in in-game ship tree order, read along each line of the tree:
+/// the Tech I hull first (Navy hulls share its group), then its branches, nearest first.
+/// Empire lines come first, then capitals, haulers and the ORE (mining) tree.
+/// The SDE has no layout for the ship tree, so this list is maintained by hand.
+/// Groups not listed here go after these, alphabetically.
+pub const SHIP_TREE_ORDER: &[&str] = &[
+    // starter hulls
+    "Corvette", "Shuttle",
+    // frigate line
+    "Frigate", "Interceptor", "Assault Frigate", "Covert Ops", "Stealth Bomber",
+    "Electronic Attack Ship", "Logistics Frigate", "Prototype Exploration Ship",
+    // destroyer line
+    "Destroyer", "Interdictor", "Command Destroyer", "Tactical Destroyer",
+    // cruiser line
+    "Cruiser", "Combat Recon Ship", "Force Recon Ship", "Heavy Assault Cruiser",
+    "Heavy Interdiction Cruiser", "Logistics", "Strategic Cruiser", "Flag Cruiser",
+    // battlecruiser line
+    "Combat Battlecruiser", "Attack Battlecruiser", "Command Ship",
+    // battleship line
+    "Battleship", "Black Ops", "Marauder",
+    // capitals
+    // (command carriers share the Carrier group)
+    "Dreadnought", "Lancer Dreadnought", "Carrier", "Supercarrier", "Force Auxiliary", "Titan",
+    // empire haulers
+    "Hauler", "Industrial", "Deep Space Transport", "Blockade Runner", "Freighter", "Jump Freighter",
+    // ORE (mining) tree; mining destroyers share the Destroyer group, the ORE hauler shares Hauler
+    "Mining Frigate", "Expedition Frigate", "Mining Barge", "Exhumer",
+    "Industrial Command Ship", "Capital Industrial Ship",
+];
+
+/// Sort position of a group: ship groups follow the ship tree, everything else is alphabetical.
+pub fn group_rank(category: &str, group: &str) -> usize {
+    if category == "Ship" {
+        SHIP_TREE_ORDER.iter().position(|g| *g == group).unwrap_or(SHIP_TREE_ORDER.len())
+    } else {
+        0
+    }
+}
+
 fn meta_group_name(id: u32) -> Option<&'static str> {
     Some(match id {
         1 => "Tech I",
@@ -504,7 +543,7 @@ pub fn spawn_build(zip_path: Option<PathBuf>, ctx: eframe::egui::Context) -> Pro
     }));
     let p = progress.clone();
     std::thread::spawn(move || {
-        let result = (match zip_path {
+        let result = match zip_path {
                 Some(path) => build_dataset(&path, &p),
                 None => {
                     let tmp = std::env::temp_dir().join("eve-bpo-tracker-sde.zip");
@@ -512,7 +551,7 @@ pub fn spawn_build(zip_path: Option<PathBuf>, ctx: eframe::egui::Context) -> Pro
                     let _ = fs::remove_file(&tmp);
                     r
                 }
-            });
+            };
         if let Ok(mut g) = p.lock() {
             g.result = Some(result);
         }
@@ -592,6 +631,17 @@ mod tests {
         let c = Collection::load(dir.join("c.json"));
         assert!(c.get(1001).fully_researched() && c.get(1001).fav);
         assert!(c.get(1057).ignored);
+    }
+
+    #[test]
+    fn ship_tree_order() {
+        let mut groups = vec!["Titan", "Battleship", "Zzz New Hull", "Frigate", "Interceptor", "Cruiser"];
+        groups.sort_by_key(|g| (group_rank("Ship", g), g.to_lowercase()));
+        assert_eq!(groups, ["Frigate", "Interceptor", "Cruiser", "Battleship", "Titan", "Zzz New Hull"]);
+        let mut frig = vec!["Logistics Frigate", "Covert Ops", "Assault Frigate", "Interceptor", "Electronic Attack Ship"];
+        frig.sort_by_key(|g| group_rank("Ship", g));
+        assert_eq!(frig, ["Interceptor", "Assault Frigate", "Covert Ops", "Electronic Attack Ship", "Logistics Frigate"]);
+        assert_eq!(group_rank("Module", "Anything"), 0);
     }
 
     #[test]

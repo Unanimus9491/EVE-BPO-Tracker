@@ -33,7 +33,7 @@ const SORT: [&str; 4] = ["Sort: Name", "Sort: Group", "Sort: Missing first", "So
 const SORT_GROUP: usize = 1;
 
 enum Item {
-    Header { group: String, category: String, ids: Vec<u32> },
+    Header { group: String, category: String, ids: Vec<u32>, collapsed: bool },
     Card(usize), // index into entries
 }
 
@@ -59,6 +59,9 @@ struct Filters {
     market: usize,
     sort: usize,
     hide_ignored: bool,
+    /// Tech II BPOs essentially can't be obtained (only from rare events or dev gifts),
+    /// and Tech III only comes as reverse-engineered copies.
+    hide_t2_t3: bool,
 }
 
 pub struct TrackerApp {
@@ -68,6 +71,9 @@ pub struct TrackerApp {
     icons: Icons,
     f: Filters,
     applied: Option<Filters>,
+    /// Collapsed groups as (category, group); remembered between sessions in settings.json.
+    collapsed: BTreeSet<(String, String)>,
+    collapse_changed: bool,
     applied_rev: u64,
     items: Vec<Item>,
     shown: usize,
@@ -105,11 +111,14 @@ impl TrackerApp {
                 status: 0,
                 tech: None,
                 group: None,
-                market: 0,
-                sort: 0,
+                market: 1, // most blueprints that aren't market listed can't be obtained as BPOs
+                sort: SORT_GROUP,
                 hide_ignored: true,
+                hide_t2_t3: true,
             },
             applied: None,
+            collapsed: BTreeSet::new(),
+            collapse_changed: false,
             applied_rev: 0,
             items: Vec::new(),
             shown: 0,
@@ -120,17 +129,64 @@ impl TrackerApp {
             build: None,
             test: None,
         };
+        app.load_settings();
         if let Some(out) = std::env::var_os("BPO_SCREENSHOT") {
             let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
             app.f.tab = num("BPO_TEST_TAB").unwrap_or(0);
-            app.f.sort = num("BPO_TEST_SORT").unwrap_or(0);
+            app.f.sort = num("BPO_TEST_SORT").unwrap_or(SORT_GROUP);
+            app.f.market = num("BPO_TEST_MARKET").unwrap_or(1);
             app.f.status = num("BPO_TEST_STATUS").unwrap_or(0);
             app.selected = num("BPO_TEST_SELECT").map(|v| v as u32);
             app.f.search = std::env::var("BPO_TEST_SEARCH").unwrap_or_default();
+            if let Ok(g) = std::env::var("BPO_TEST_COLLAPSE") {
+                app.collapsed.insert(("Ship".into(), g));
+            }
             app.test = Some(TestHook { out: out.into(), frame: 0, done: Default::default() });
         }
         app.refresh_options();
         app
+    }
+
+    fn load_settings(&mut self) {
+        #[derive(serde::Deserialize, Default)]
+        #[serde(default)]
+        struct Settings {
+            collapsed: Vec<(String, String)>,
+        }
+        let s: Settings = std::fs::read_to_string(self.dir.join("settings.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        self.collapsed = s.collapsed.into_iter().collect();
+    }
+
+    fn save_settings(&self) {
+        let json = serde_json::json!({ "collapsed": self.collapsed.iter().collect::<Vec<_>>() });
+        if let Ok(bytes) = serde_json::to_vec_pretty(&json) {
+            let _ = data::atomic_write(&self.dir.join("settings.json"), &bytes);
+        }
+    }
+
+    fn set_collapsed(&mut self, keys: Vec<(String, String)>, collapse: bool) {
+        for k in keys {
+            if collapse {
+                self.collapsed.insert(k);
+            } else {
+                self.collapsed.remove(&k);
+            }
+        }
+        self.collapse_changed = true;
+        self.save_settings();
+    }
+
+    fn visible_group_keys(&self) -> Vec<(String, String)> {
+        self.items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Header { group, category, .. } => Some((category.clone(), group.clone())),
+                _ => None,
+            })
+            .collect()
     }
 
     fn entry_by_id(&self, id: u32) -> Option<&Entry> {
@@ -171,6 +227,9 @@ impl TrackerApp {
         if (f.market == 1 && !e.market) || (f.market == 2 && e.market) {
             return false;
         }
+        if self.hides_tech(e) {
+            return false;
+        }
         let s = self.coll.get(e.id);
         if f.hide_ignored && s.ignored && f.status != 7 {
             return false;
@@ -190,9 +249,10 @@ impl TrackerApp {
     /// Rebuild the visible list when filters change (not on every tick, so a card you
     /// just ticked doesn't vanish from under the mouse while a status filter is on).
     fn refilter_if_needed(&mut self, force: bool) {
-        if !force && self.applied.as_ref() == Some(&self.f) {
+        if !force && !self.collapse_changed && self.applied.as_ref() == Some(&self.f) {
             return;
         }
+        self.collapse_changed = false;
         if self.applied.as_ref().is_none_or(|a| a.tab != self.f.tab) {
             self.refresh_options();
         }
@@ -202,7 +262,8 @@ impl TrackerApp {
         match self.f.sort {
             SORT_GROUP => idx.sort_by_cached_key(|i| {
                 let e = &self.entries[*i];
-                (e.category.to_lowercase(), e.group.to_lowercase(), e.name.to_lowercase())
+                // Ships follow the in-game ship tree; other groups are alphabetical.
+                (e.category.to_lowercase(), data::group_rank(&e.category, &e.group), e.group.to_lowercase(), e.name.to_lowercase())
             }),
             2 | 3 => {
                 let missing_first = self.f.sort == 2;
@@ -212,16 +273,28 @@ impl TrackerApp {
         }
         self.shown = idx.len();
         self.items.clear();
+        let mut header: Option<usize> = None; // index of the current group's header in items
         for i in idx {
             if self.f.sort == SORT_GROUP {
                 let e = &self.entries[i];
-                let new_group = !matches!(self.items.iter().rev().find(|it| matches!(it, Item::Header { .. })),
-                    Some(Item::Header { group, category, .. }) if *group == e.group && *category == e.category);
-                if new_group {
-                    self.items.push(Item::Header { group: e.group.clone(), category: e.category.clone(), ids: Vec::new() });
+                let same = header.is_some_and(|h| {
+                    matches!(&self.items[h], Item::Header { group, category, .. } if *group == e.group && *category == e.category)
+                });
+                if !same {
+                    let collapsed = self.collapsed.contains(&(e.category.clone(), e.group.clone()));
+                    self.items.push(Item::Header {
+                        group: e.group.clone(),
+                        category: e.category.clone(),
+                        ids: Vec::new(),
+                        collapsed,
+                    });
+                    header = Some(self.items.len() - 1);
                 }
-                if let Some(Item::Header { ids, .. }) = self.items.iter_mut().rev().find(|it| matches!(it, Item::Header { .. })) {
+                if let Some(Item::Header { ids, collapsed, .. }) = header.map(|h| &mut self.items[h]) {
                     ids.push(e.id);
+                    if *collapsed {
+                        continue; // count it in the header, but don't show the card
+                    }
                 }
             }
             self.items.push(Item::Card(i));
@@ -352,9 +425,22 @@ impl TrackerApp {
         });
     }
 
+    /// Hidden as Tech II/III, unless the tech filter explicitly asks for that tech level.
+    fn hides_tech(&self, e: &Entry) -> bool {
+        self.f.hide_t2_t3
+            && (e.tech == "Tech II" || e.tech == "Tech III")
+            && self.f.tech.as_deref() != Some(e.tech.as_str())
+    }
+
     fn stats_text(&self) -> (usize, usize, usize) {
         let (mut counted, mut owned, mut full) = (0, 0, 0);
-        for e in self.entries.iter().filter(|e| self.in_tab(e)) {
+        // Respect the market filter, so "market listed only" gives an achievable total.
+        let market_ok = |e: &Entry| match self.f.market {
+            1 => e.market,
+            2 => !e.market,
+            _ => true,
+        };
+        for e in self.entries.iter().filter(|e| self.in_tab(e) && market_ok(e) && !self.hides_tech(e)) {
             let s = self.coll.get(e.id);
             if s.ignored {
                 continue;
@@ -403,21 +489,22 @@ impl TrackerApp {
                         .desired_width(260.0)
                         .margin(vec2(8.0, 6.0)),
                 );
+                ui.label(RichText::new(format!("Showing {}", self.shown)).color(MUTED));
             });
         });
 
-        // filters
-        ui.horizontal(|ui| {
-            combo(ui, "status", 190.0, &mut self.f.status, &STATUS);
+        // filters (wrap onto a second line in narrow windows)
+        ui.horizontal_wrapped(|ui| {
+            combo(ui, "status", 150.0, &mut self.f.status, &STATUS);
             let tech_label = self.f.tech.clone().unwrap_or_else(|| "Any tech".into());
-            egui::ComboBox::from_id_salt("tech").width(120.0).selected_text(tech_label).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("tech").width(100.0).selected_text(tech_label).show_ui(ui, |ui| {
                 ui.selectable_value(&mut self.f.tech, None, "Any tech");
                 for t in &self.techs {
                     ui.selectable_value(&mut self.f.tech, Some(t.clone()), t);
                 }
             });
             let group_label = self.f.group.clone().unwrap_or_else(|| "Any group".into());
-            egui::ComboBox::from_id_salt("group").width(210.0).height(400.0).selected_text(group_label).show_ui(
+            egui::ComboBox::from_id_salt("group").width(160.0).height(400.0).selected_text(group_label).show_ui(
                 ui,
                 |ui| {
                     ui.selectable_value(&mut self.f.group, None, "Any group");
@@ -426,12 +513,23 @@ impl TrackerApp {
                     }
                 },
             );
-            combo(ui, "market", 170.0, &mut self.f.market, &MARKET);
-            combo(ui, "sort", 140.0, &mut self.f.sort, &SORT);
+            combo(ui, "market", 150.0, &mut self.f.market, &MARKET);
+            combo(ui, "sort", 120.0, &mut self.f.sort, &SORT);
+            if self.f.sort == SORT_GROUP {
+                if ui.button("Expand all").clicked() {
+                    let keys = self.visible_group_keys();
+                    self.set_collapsed(keys, false);
+                }
+                if ui.button("Collapse all").clicked() {
+                    let keys = self.visible_group_keys();
+                    self.set_collapsed(keys, true);
+                }
+            }
             ui.checkbox(&mut self.f.hide_ignored, "Hide ignored");
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new(format!("Showing {}", self.shown)).color(MUTED));
-            });
+            ui.checkbox(&mut self.f.hide_t2_t3, "Hide Tech II/III").on_hover_text(
+                "Tech II BPOs can't normally be obtained (only from rare events or dev gifts), \
+                 and Tech III only comes as reverse-engineered copies",
+            );
         });
         ui.add_space(6.0);
     }
@@ -452,6 +550,7 @@ impl TrackerApp {
         let total_h = rows.last().map(|(_, y, h)| y + h).unwrap_or(0.0);
         let mut edits: Vec<(u32, Edit)> = Vec::new();
         let mut select: Option<u32> = None;
+        let mut toggle: Option<((String, String), bool)> = None;
         let shift = ui.input(|i| i.modifiers.shift);
 
         egui::ScrollArea::vertical().auto_shrink(false).wheel_scroll_multiplier(vec2(1.0, 1.6)).show_viewport(
@@ -465,9 +564,11 @@ impl TrackerApp {
                     }
                     match row {
                         Row::Header(i) => {
-                            if let Item::Header { group, category, ids } = &self.items[*i] {
+                            if let Item::Header { group, category, ids, collapsed } = &self.items[*i] {
                                 let rect = Rect::from_min_size(origin + vec2(0.0, *y), vec2(cols as f32 * CELL_W, HEADER_H));
-                                self.paint_header(ui, rect, group, category, ids);
+                                if self.header(ui, rect, group, category, ids, *collapsed) {
+                                    toggle = Some(((category.clone(), group.clone()), !*collapsed));
+                                }
                             }
                         }
                         Row::Cards(a, b) => {
@@ -491,16 +592,34 @@ impl TrackerApp {
         if select.is_some() {
             self.selected = select;
         }
+        if let Some((key, collapse)) = toggle {
+            self.set_collapsed(vec![key], collapse);
+        }
     }
 
-    fn paint_header(&self, ui: &Ui, rect: Rect, group: &str, category: &str, ids: &[u32]) {
+    /// Draws a group header; returns true when it was clicked (to collapse/expand).
+    fn header(&self, ui: &mut Ui, rect: Rect, group: &str, category: &str, ids: &[u32], collapsed: bool) -> bool {
         let r = Rect::from_min_max(rect.min + vec2(GAP / 2.0 + 2.0, 0.0), rect.max - vec2(GAP / 2.0 + 2.0, 0.0));
+        let resp = ui
+            .interact(r, ui.scope_id().with(("header", category, group)), Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text(if collapsed { "Click to expand" } else { "Click to collapse" });
         let p = ui.painter();
         let owned = ids.iter().filter(|i| self.coll.get(**i).owned).count();
         let full = ids.iter().filter(|i| self.coll.get(**i).fully_researched()).count();
         let complete = !ids.is_empty() && owned == ids.len();
         let mid = r.top() + 27.0;
-        let title = p.text(pos2(r.left(), mid), Align2::LEFT_CENTER, group, font_bold(17.0), TEXT);
+        // chevron: points right when collapsed, down when open
+        let c = pos2(r.left() + 6.0, mid);
+        let pts = if collapsed {
+            vec![c + vec2(-3.0, -5.0), c + vec2(3.5, 0.0), c + vec2(-3.0, 5.0)]
+        } else {
+            vec![c + vec2(-5.0, -3.0), c + vec2(5.0, -3.0), c + vec2(0.0, 3.5)]
+        };
+        let chevron = if resp.hovered() { GOLD_PALE } else { MUTED };
+        p.add(egui::Shape::convex_polygon(pts, chevron, Stroke::NONE));
+        let title_color = if resp.hovered() { GOLD_PALE } else { TEXT };
+        let title = p.text(pos2(r.left() + 20.0, mid), Align2::LEFT_CENTER, group, font_bold(17.0), title_color);
         p.text(pos2(title.right() + 12.0, mid + 1.0), Align2::LEFT_CENTER, category.to_uppercase(), font(11.0), MUTED);
         // progress bar + count
         let bar = Rect::from_min_size(pos2(r.right() - 120.0, mid - 2.5), vec2(120.0, 5.0));
@@ -518,6 +637,7 @@ impl TrackerApp {
         let base = r.bottom() - 8.0;
         p.rect_filled(Rect::from_min_size(pos2(r.left(), base), vec2(r.width(), 1.0)), 0, BORDER);
         p.rect_filled(Rect::from_min_size(pos2(r.left(), base - 1.0), vec2(36.0, 3.0)), 1, GOLD);
+        resp.clicked()
     }
 
     fn slot(

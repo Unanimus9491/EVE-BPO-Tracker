@@ -29,14 +29,22 @@ Each card is one blueprint and has three slots:
 The card lights up in pale gold when owned and gets a Solus Gold border at ME 10 / TE 20.
 Click ☆ to favourite. Right-click for more (copies, max research, ignore).
 The side panel edits the selected card, including notes.
-**Sort: Group** splits the grid into groups, each with a header and a progress bar.
+The grid opens sorted by group, showing **market-listed blueprints only** with **Tech II and III hidden**.
+Most blueprints that aren't market listed can't be obtained as originals, Tech II BPOs only come from
+rare events or dev gifts, and Tech III only comes as reverse-engineered copies. The owned totals follow
+these filters too. Untick **Hide Tech II/III** (or pick a tech level in the tech filter) to see them.
+Each group has a header with a progress bar. Click a header to collapse or expand it, or use
+**Expand all / Collapse all**. Collapsed groups are remembered between sessions.
+Ship groups follow the in-game ship tree (frigates → destroyers → cruisers → battlecruisers →
+battleships → capitals → industrial). Other groups are alphabetical. The ship order is a
+hand-made list in `src/data.rs` (`SHIP_TREE_ORDER`), because the game data doesn't include the tree layout.
 
 **Ignore** removes a blueprint from your completion count, for example BPC-only items
 you don't count as part of the set.
 
 ## Your data
 Saved automatically in `%APPDATA%\EVE BPO Tracker\`: `collection.json` (your progress), `bpos.json`
-(blueprint list) and `icons\` (image cache from images.evetech.net). This is the same folder and
+(blueprint list), `settings.json` (collapsed groups) and `icons\` (image cache from images.evetech.net). This is the same folder and
 format the earlier Python version used, so existing progress carries over.
 Use *File › Back up collection* occasionally. *Export to CSV* gives you a spreadsheet.
 
