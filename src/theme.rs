@@ -68,7 +68,7 @@ pub fn install(ctx: &egui::Context) {
         v.window_stroke = Stroke::new(1.0, BORDER);
         v.extreme_bg_color = CHARCOAL; // text edits
         v.faint_bg_color = CHARCOAL;
-        v.override_text_color = Some(TEXT);
+        // No override_text_color: selected items (gold background) need their own dark text.
         v.hyperlink_color = GOLD_PALE;
         v.selection.bg_fill = GOLD;
         v.selection.stroke = Stroke::new(1.0, GROUND);
@@ -96,6 +96,7 @@ pub fn install(ctx: &egui::Context) {
         v.widgets.active.bg_fill = GROUND;
         v.widgets.noninteractive.bg_fill = GROUND;
         v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+        v.widgets.hovered.weak_bg_fill = BORDER; // visible hover in menus and dropdowns
         v.widgets.hovered.bg_stroke = Stroke::new(1.0, GOLD_PALE);
         v.widgets.hovered.fg_stroke = Stroke::new(1.5, GOLD_PALE);
         v.widgets.active.bg_stroke = Stroke::new(1.0, GOLD);

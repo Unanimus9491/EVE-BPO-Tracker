@@ -98,6 +98,8 @@ pub struct TrackerApp {
     sync: Option<esi::Sync>,
     sync_manual: bool,
     sync_status: String,
+    /// Longer explanation, shown when hovering the status.
+    sync_detail: String,
     sync_failed: bool,
     jobs: Vec<esi::Job>,
     animating: bool,
@@ -154,6 +156,7 @@ impl TrackerApp {
             sync: None,
             sync_manual: false,
             sync_status: String::new(),
+            sync_detail: String::new(),
             sync_failed: false,
             jobs: Vec::new(),
             animating: false,
@@ -202,6 +205,7 @@ impl TrackerApp {
             self.sync = Some(esi::start_sync(self.accounts.clone(), ctx.clone()));
             self.sync_manual = manual;
             self.sync_status = "Syncing with EVE…".into();
+            self.sync_detail.clear();
             self.sync_failed = false;
         }
     }
@@ -254,8 +258,12 @@ impl TrackerApp {
                     }
                     self.sync_status = format!("Synced {} · {}", now_hhmm(), parts.join(", "));
                     if !r.without_job_scope.is_empty() {
-                        self.sync_status +=
-                            &format!(" · log in again to track research: {}", r.without_job_scope.join(", "));
+                        self.sync_status += " · log in again for research";
+                        self.sync_detail = format!(
+                            "To track research and other industry jobs, log these characters in again \
+                             (Characters › Log in with EVE): {}",
+                            r.without_job_scope.join(", ")
+                        );
                     }
                 } else {
                     self.sync_failed = true;
@@ -265,7 +273,7 @@ impl TrackerApp {
             if !r.errors.is_empty() && (self.sync_manual || self.accounts.iter().any(|a| a.needs_login)) {
                 self.dialog = Dialog::Message { title: "EVE sync problems".into(), body: r.errors.join("\n") };
             } else if !r.errors.is_empty() {
-                self.sync_status += &format!(" ({})", r.errors.join("; "));
+                self.sync_detail = r.errors.join("\n");
             }
         }
     }
@@ -734,7 +742,11 @@ impl TrackerApp {
                         ui.spinner();
                     }
                     let color = if self.sync_failed { MISSING_WARN } else { MUTED };
-                    ui.label(RichText::new(&self.sync_status).color(color));
+                    // Keep the status short so it can't push the header around; details on hover.
+                    let status = ui.add(egui::Label::new(RichText::new(&self.sync_status).color(color)).truncate());
+                    if !self.sync_detail.is_empty() {
+                        status.on_hover_text(&self.sync_detail);
+                    }
                     if self.accounts.len() > 1 {
                         self.character_picker(ui);
                     }
@@ -1581,7 +1593,8 @@ impl eframe::App for TrackerApp {
 
 // ------------------------------------------------------------------ small widgets
 fn combo(ui: &mut Ui, id: &str, width: f32, value: &mut usize, options: &[&str]) {
-    egui::ComboBox::from_id_salt(id).width(width).selected_text(options[*value]).show_ui(ui, |ui| {
+    // Tall enough to show every option without scrolling.
+    egui::ComboBox::from_id_salt(id).width(width).height(500.0).selected_text(options[*value]).show_ui(ui, |ui| {
         for (i, o) in options.iter().enumerate() {
             ui.selectable_value(value, i, *o);
         }
