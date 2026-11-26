@@ -69,6 +69,15 @@ The login uses EVE's PKCE flow for desktop apps, so no secret is stored in the a
 Login tokens are kept in `accounts.json` in your data folder. Remove a character via the
 Characters menu, or revoke access at any time from the third-party applications page of your EVE account.
 
+## Updating
+From 0.4.0 on, the app checks GitHub for a newer release each time it starts. When there is one,
+a banner offers **Update and restart**: it downloads the new exe, swaps it in and reopens the app.
+You can also use **Help › Check for updates…**. The previous exe is kept as `….exe.old` until the
+next start, and nothing changes if the download fails.
+
+This needs the repo's releases to be public. Keep the exe in a folder you own, like Documents or
+Desktop, rather than Program Files, so it's allowed to replace itself.
+
 ## Your data
 Saved automatically in `%APPDATA%\EVE BPO Tracker\`: `collection.json` (your progress), `bpos.json`
 (blueprint list), `settings.json` (collapsed groups), `accounts.json`, `sync_details.json` and `jobs.json`
@@ -86,5 +95,16 @@ Use *File › Back up collection* occasionally. *Export to CSV* gives you a spre
 - `src/data.rs`: blueprint list builder, collection state, CSV export
 - `src/esi.rs`: EVE login (SSO with PKCE) and blueprint sync
 - `src/icons.rs`: background image loading and disk cache
+- `src/updater.rs`: in-app updates from GitHub releases
 - `src/app.rs`: the window (tabs, filters, card grid, detail panel)
 - `src/theme.rs`: Solus colours and fonts
+
+## License
+The code is released under the [MIT License](LICENSE). Copyright © 2026 Solus Interactive.
+
+This licence covers this project's own code only. The bundled Inter font is under the SIL Open Font License
+(`assets/fonts/OFL.txt`). Game data and images the app downloads from CCP (the SDE, ESI and
+images.evetech.net) stay subject to CCP's own terms.
+
+EVE Online and the EVE logo are trademarks of CCP hf. All EVE-related data and imagery is the intellectual
+property of CCP hf. This project is not affiliated with or endorsed by CCP hf.

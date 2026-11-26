@@ -2,6 +2,7 @@
 
 use crate::data::{self, Collection, Edit, Entry, ME_MAX, Progress, TABS, TE_MAX};
 use crate::esi::{self, Account, SyncedOriginal};
+use crate::updater::{self, UpdateInfo};
 use std::collections::HashMap;
 use crate::icons::Icons;
 use crate::theme::*;
@@ -52,6 +53,8 @@ enum Dialog {
     Message { title: String, body: String },
     ConfirmRestore(PathBuf),
     About,
+    ReleaseNotes(String, String),
+    UpdateFailed(String),
 }
 
 #[derive(Clone, PartialEq)]
@@ -103,6 +106,13 @@ pub struct TrackerApp {
     sync_failed: bool,
     jobs: Vec<esi::Job>,
     animating: bool,
+    // in-app updates
+    update_check: Option<updater::Shared>,
+    update_manual: bool,
+    update_avail: Option<UpdateInfo>,
+    update_hidden: bool,
+    update_install: Option<updater::Shared>,
+    checked_updates: bool,
     started_sync: bool,
     ctx: Option<egui::Context>,
 }
@@ -160,6 +170,12 @@ impl TrackerApp {
             sync_failed: false,
             jobs: Vec::new(),
             animating: false,
+            update_check: None,
+            update_manual: false,
+            update_avail: None,
+            update_hidden: false,
+            update_install: None,
+            checked_updates: false,
             started_sync: false,
             ctx: None,
         };
@@ -175,6 +191,9 @@ impl TrackerApp {
             app.f.status = num("BPO_TEST_STATUS").unwrap_or(0);
             app.selected = num("BPO_TEST_SELECT").map(|v| v as u32);
             app.f.search = std::env::var("BPO_TEST_SEARCH").unwrap_or_default();
+            if let Ok(v) = std::env::var("BPO_TEST_UPDATE") {
+                app.update_avail = Some(UpdateInfo { version: v, notes: String::new(), url: String::new(), size: 0 });
+            }
             if std::env::var_os("BPO_TEST_ABOUT").is_some() {
                 app.dialog = Dialog::About;
             }
@@ -208,6 +227,105 @@ impl TrackerApp {
             self.sync_detail.clear();
             self.sync_failed = false;
         }
+    }
+
+    // ------------------------------------------------------------------ updates
+    fn check_for_updates(&mut self, manual: bool) {
+        if self.update_check.is_some() || self.update_install.is_some() {
+            return;
+        }
+        if let Some(ctx) = &self.ctx {
+            self.update_check = Some(updater::spawn_check(ctx.clone()));
+            self.update_manual = manual;
+        }
+    }
+
+    fn poll_updates(&mut self) {
+        let checked = self.update_check.as_ref().and_then(|s| s.lock().ok().and_then(|mut g| g.check.take()));
+        if let Some(result) = checked {
+            self.update_check = None;
+            match result {
+                Ok(Some(info)) => {
+                    self.update_avail = Some(info);
+                    self.update_hidden = false;
+                }
+                Ok(None) if self.update_manual => {
+                    self.dialog = Dialog::Message {
+                        title: "You're up to date".into(),
+                        body: format!("Version {} is the latest release.", data::VERSION),
+                    };
+                }
+                Err(e) if self.update_manual => {
+                    self.dialog = Dialog::Message { title: "Couldn't check for updates".into(), body: e };
+                }
+                _ => {} // quiet for the automatic start-up check
+            }
+        }
+        let installed = self.update_install.as_ref().and_then(|s| s.lock().ok().and_then(|mut g| g.install.take()));
+        if let Some(result) = installed {
+            self.update_install = None;
+            match result.and_then(|exe| {
+                self.coll.save();
+                self.save_settings();
+                updater::relaunch(&exe)
+            }) {
+                Ok(()) => {
+                    if let Some(ctx) = &self.ctx {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+                Err(e) => self.dialog = Dialog::UpdateFailed(e),
+            }
+        }
+    }
+
+    /// The gold-edged strip that offers a new version.
+    fn update_banner(&mut self, ui: &mut Ui) {
+        let Some(info) = self.update_avail.clone() else { return };
+        if self.update_hidden && self.update_install.is_none() {
+            return;
+        }
+        egui::Frame::new()
+            .fill(CHARCOAL)
+            .stroke(Stroke::new(1.0, pale_gold_a(140)))
+            .corner_radius(8)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    if let Some(st) = &self.update_install {
+                        let (done, total) = st.lock().map(|g| (g.downloaded, g.total)).unwrap_or_default();
+                        ui.spinner();
+                        ui.label(RichText::new(format!("Downloading version {}…", info.version)).color(GOLD_PALE));
+                        let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+                        ui.add(egui::ProgressBar::new(frac).fill(GOLD).desired_width(220.0).desired_height(6.0));
+                        ui.label(
+                            RichText::new(format!("{:.1} / {:.1} MB", done as f64 / 1e6, total as f64 / 1e6))
+                                .color(MUTED),
+                        );
+                        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                    } else {
+                        ui.label(RichText::new(format!("Version {} is available", info.version)).font(font_bold(13.5)).color(GOLD));
+                        ui.label(RichText::new(format!("(you have {})", data::VERSION)).color(MUTED));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.button("Later").clicked() {
+                                self.update_hidden = true;
+                            }
+                            if ui.button("What's new").clicked() {
+                                self.dialog = Dialog::ReleaseNotes(info.version.clone(), info.notes.clone());
+                            }
+                            let btn = egui::Button::new(RichText::new("Update and restart").color(GROUND).font(font_bold(13.5)))
+                                .fill(GOLD);
+                            if ui.add(btn).clicked()
+                                && let Some(ctx) = &self.ctx {
+                                    self.coll.save();
+                                    self.update_install = Some(updater::spawn_install(info.clone(), ctx.clone()));
+                                }
+                        });
+                    }
+                });
+            });
+        ui.add_space(6.0);
     }
 
     fn poll_esi(&mut self) {
@@ -632,6 +750,13 @@ impl TrackerApp {
             });
             ui.menu_button("Characters", |ui| self.characters_menu(ui));
             ui.menu_button("Help", |ui| {
+                if ui.button("Check for updates…").clicked() {
+                    self.update_hidden = false;
+                    if self.update_avail.is_none() {
+                        self.check_for_updates(true);
+                    }
+                    ui.close();
+                }
                 if ui.button("About EVE BPO Tracker").clicked() {
                     self.dialog = Dialog::About;
                     ui.close();
@@ -1444,6 +1569,45 @@ impl TrackerApp {
                 });
                 close = r.inner || r.should_close();
             }
+            Dialog::ReleaseNotes(version, notes) => {
+                let r = egui::Modal::new(egui::Id::unique("notes")).show(ctx, |ui| {
+                    ui.set_width(460.0);
+                    ui.label(RichText::new(format!("What's new in {version}")).font(font_bold(16.0)));
+                    ui.add_space(6.0);
+                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                        if notes.is_empty() {
+                            ui.label(RichText::new("No notes were written for this release.").color(MUTED));
+                        } else {
+                            ui.label(notes.as_str());
+                        }
+                    });
+                    ui.add_space(10.0);
+                    ui.button("Close").clicked()
+                });
+                close = r.inner || r.should_close();
+            }
+            Dialog::UpdateFailed(msg) => {
+                let msg = msg.clone();
+                let mut open_page = false;
+                let r = egui::Modal::new(egui::Id::unique("updfail")).show(ctx, |ui| {
+                    ui.set_width(440.0);
+                    ui.label(RichText::new("Update didn't complete").font(font_bold(16.0)));
+                    ui.add_space(6.0);
+                    ui.label(msg.as_str());
+                    ui.label(RichText::new("Your current version is untouched.").color(MUTED));
+                    ui.add_space(10.0);
+                    let mut close = false;
+                    ui.horizontal(|ui| {
+                        open_page = ui.button("Open releases page").clicked();
+                        close = ui.button("Close").clicked();
+                    });
+                    close
+                });
+                if open_page {
+                    esi::open_in_browser(&updater::releases_page());
+                }
+                close = r.inner || r.should_close();
+            }
             Dialog::About => {
                 let mut open_folder = false;
                 let r = egui::Modal::new(egui::Id::unique("about")).show(ctx, |ui| {
@@ -1557,8 +1721,13 @@ impl eframe::App for TrackerApp {
             self.started_sync = true;
             self.start_sync(false); // pick up changes since last time
         }
+        if !self.checked_updates && self.test.is_none() {
+            self.checked_updates = true;
+            self.check_for_updates(false);
+        }
         self.poll_build();
         self.poll_esi();
+        self.poll_updates();
         self.refilter_if_needed(false);
 
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
@@ -1571,6 +1740,7 @@ impl eframe::App for TrackerApp {
         egui::CentralPanel::default_margins()
             .frame(egui::Frame::new().fill(GROUND).inner_margin(egui::Margin { left: 16, right: 8, top: 6, bottom: 0 }))
             .show(ui, |ui| {
+                self.update_banner(ui);
                 self.header_area(ui);
                 self.grid(ui);
             });

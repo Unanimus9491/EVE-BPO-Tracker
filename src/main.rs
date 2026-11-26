@@ -6,6 +6,7 @@ mod data;
 mod esi;
 mod icons;
 mod theme;
+mod updater;
 
 use eframe::egui;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ fn window_icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result {
+    updater::clean_up_old(); // remove the copy left behind by the last in-app update
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(format!("{} {}", data::APP_NAME, data::VERSION))
