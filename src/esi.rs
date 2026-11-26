@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 pub const CLIENT_ID: &str = "397ffb1171354fa6a686dd5c37603d5d";
 pub const CALLBACK_PORT: u16 = 51791;
 pub const REDIRECT_URI: &str = "http://localhost:51791/callback";
-pub const SCOPES: &str = "esi-characters.read_blueprints.v1";
+pub const SCOPE_JOBS: &str = "esi-industry.read_character_jobs.v1";
+pub const SCOPES: &str = "esi-characters.read_blueprints.v1 esi-industry.read_character_jobs.v1";
 const AUTHORIZE_URL: &str = "https://login.eveonline.com/v2/oauth/authorize/";
 const TOKEN_URL: &str = "https://login.eveonline.com/v2/oauth/token";
 const ESI_BASE: &str = "https://esi.evetech.net";
@@ -122,6 +123,18 @@ struct TokenResponse {
 
 /// Character ID and name from the access token (a JWT). ESI checks the signature itself
 /// whenever the token is used, so it's only read here, not verified.
+/// Scopes granted to an access token (the JWT `scp` claim: a string or a list).
+fn scopes_from_jwt(token: &str) -> Vec<String> {
+    let Some(payload) = token.split('.').nth(1) else { return Vec::new() };
+    let Ok(bytes) = URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')) else { return Vec::new() };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return Vec::new() };
+    match v.get("scp") {
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Array(a)) => a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn character_from_jwt(token: &str) -> Result<(u64, String), String> {
     let payload = token.split('.').nth(1).ok_or("Unexpected token format")?;
     let bytes = URL_SAFE_NO_PAD
@@ -305,6 +318,8 @@ fn handle_callback(mut stream: TcpStream, csrf: &str) -> Option<Result<String, S
 // ----------------------------------------------------------------------------- blueprint sync
 #[derive(Deserialize, Debug, Clone)]
 pub struct EsiBlueprint {
+    #[serde(default)]
+    pub item_id: u64,
     pub type_id: u32,
     /// -1: a single original, -2: a copy, positive: a stack of originals.
     pub quantity: i64,
@@ -391,6 +406,188 @@ fn fetch_blueprints(character_id: u64, access_token: &str) -> Result<Vec<EsiBlue
     Ok(all)
 }
 
+// ----------------------------------------------------------------------------- industry jobs
+#[derive(Deserialize, Debug, Clone)]
+struct EsiJob {
+    activity_id: u32,
+    blueprint_id: u64,
+    blueprint_type_id: u32,
+    #[serde(default)]
+    runs: u32,
+    start_date: String,
+    end_date: String,
+    status: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Activity {
+    MeResearch,
+    TeResearch,
+    Copying,
+    Manufacturing,
+    Reaction,
+}
+
+impl Activity {
+    fn from_id(id: u32) -> Option<Self> {
+        Some(match id {
+            1 => Activity::Manufacturing,
+            3 => Activity::TeResearch,
+            4 => Activity::MeResearch,
+            5 => Activity::Copying,
+            9 | 11 => Activity::Reaction,
+            _ => return None, // invention etc. use copies, not originals
+        })
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Activity::MeResearch => "ME research",
+            Activity::TeResearch => "TE research",
+            Activity::Copying => "Copying",
+            Activity::Manufacturing => "Manufacturing",
+            Activity::Reaction => "Reaction",
+        }
+    }
+
+    /// Research and copying can only be done on originals.
+    fn needs_original(self) -> bool {
+        matches!(self, Activity::MeResearch | Activity::TeResearch | Activity::Copying)
+    }
+}
+
+/// An industry job using one of your blueprints.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Job {
+    pub character: String,
+    pub type_id: u32,
+    pub activity: Activity,
+    /// Levels being researched, or runs.
+    pub runs: u32,
+    /// ME/TE level of that blueprint when the job started, if known.
+    pub from_level: Option<u8>,
+    pub start: i64,
+    pub end: i64,
+    /// "active", "paused" or "ready" (EVE's status; "active" past its end is shown as ready).
+    pub status: String,
+}
+
+impl Job {
+    pub fn is_ready(&self, now: i64) -> bool {
+        self.status == "ready" || (self.status == "active" && now >= self.end)
+    }
+    pub fn is_running(&self, now: i64) -> bool {
+        self.status == "active" && now < self.end
+    }
+    pub fn progress(&self, now: i64) -> f32 {
+        if self.end <= self.start {
+            return 1.0;
+        }
+        ((now - self.start) as f32 / (self.end - self.start) as f32).clamp(0.0, 1.0)
+    }
+    /// Level the blueprint reaches when a research job finishes.
+    pub fn to_level(&self) -> Option<u8> {
+        let max = if self.activity == Activity::TeResearch { 20 } else { 10 };
+        let step = if self.activity == Activity::TeResearch { 2 } else { 1 };
+        let runs = self.runs.min(20) as u8;
+        self.from_level.map(|f| (f + runs * step).min(max))
+    }
+}
+
+pub fn now_unix() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+/// Parses ESI timestamps like "2026-11-26T10:15:00Z" to unix seconds.
+pub fn parse_time(s: &str) -> Option<i64> {
+    let s = s.trim().trim_end_matches('Z');
+    let (date, time) = s.split_once('T')?;
+    let mut d = date.split('-').map(|x| x.parse::<i64>().ok());
+    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
+    let mut t = time.split(':');
+    let h: i64 = t.next()?.parse().ok()?;
+    let mi: i64 = t.next()?.parse().ok()?;
+    let sec: f64 = t.next().unwrap_or("0").parse().ok()?;
+    // days from civil (Howard Hinnant's algorithm)
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + h * 3600 + mi * 60 + sec as i64)
+}
+
+/// "2d 3h", "4h 12m", "9m", "<1m"
+pub fn format_remaining(secs: i64) -> String {
+    let secs = secs.max(0);
+    let (d, h, m) = (secs / 86400, (secs % 86400) / 3600, (secs % 3600) / 60);
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        "<1m".into()
+    }
+}
+
+fn fetch_jobs(character_id: u64, access_token: &str) -> Result<Vec<EsiJob>, ureq::Error> {
+    let url = format!("{ESI_BASE}/characters/{character_id}/industry/jobs");
+    let mut resp = ureq::get(&url)
+        .header("Authorization", &format!("Bearer {access_token}"))
+        .header("X-Compatibility-Date", COMPATIBILITY_DATE)
+        .header("User-Agent", USER_AGENT)
+        .header("Accept", "application/json")
+        .call()?;
+    let text = resp.body_mut().read_to_string()?;
+    serde_json::from_str(&text).map_err(|e| ureq::Error::Other(Box::new(e)))
+}
+
+/// Turns ESI jobs into tracker jobs, filling in the starting ME/TE from the blueprint list.
+fn convert_jobs(character: &str, jobs: &[EsiJob], bps: &[EsiBlueprint]) -> Vec<Job> {
+    let levels: HashMap<u64, (u8, u8)> = bps
+        .iter()
+        .map(|b| (b.item_id, (b.material_efficiency.clamp(0, 10) as u8, b.time_efficiency.clamp(0, 20) as u8)))
+        .collect();
+    jobs.iter()
+        .filter(|j| matches!(j.status.as_str(), "active" | "paused" | "ready"))
+        .filter_map(|j| {
+            let activity = Activity::from_id(j.activity_id)?;
+            let from_level = levels.get(&j.blueprint_id).map(|(me, te)| match activity {
+                Activity::TeResearch => *te,
+                _ => *me,
+            });
+            Some(Job {
+                character: character.to_string(),
+                type_id: j.blueprint_type_id,
+                activity,
+                runs: j.runs,
+                from_level,
+                start: parse_time(&j.start_date)?,
+                end: parse_time(&j.end_date)?,
+                status: j.status.clone(),
+            })
+        })
+        .collect()
+}
+
+pub fn jobs_path(dir: &Path) -> PathBuf {
+    dir.join("jobs.json")
+}
+
+pub fn load_jobs(path: &Path) -> Vec<Job> {
+    std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+pub fn save_jobs(path: &Path, jobs: &[Job]) {
+    if let Ok(json) = serde_json::to_vec(jobs) {
+        let _ = atomic_write(path, &json);
+    }
+}
+
 #[derive(Default)]
 pub struct SyncResult {
     pub owned: HashMap<u32, Owned>,
@@ -401,6 +598,12 @@ pub struct SyncResult {
     pub errors: Vec<String>,
     /// Accounts with refreshed tokens / login flags, to save back.
     pub accounts: Vec<Account>,
+    pub jobs: Vec<Job>,
+    /// Blueprint types tied up in research/copy jobs but missing from the blueprint list:
+    /// they're still owned, so a sync mustn't mark them missing.
+    pub in_jobs_unlisted: Vec<u32>,
+    /// Characters whose login predates job tracking (need to log in again for it).
+    pub without_job_scope: Vec<String>,
 }
 
 pub struct Sync {
@@ -426,10 +629,36 @@ pub fn start_sync(accounts: Vec<Account>, ctx: eframe::egui::Context) -> Sync {
             match tokens {
                 Ok(t) => {
                     acc.refresh_token = t.refresh_token; // EVE rotates refresh tokens
+                    let scopes = scopes_from_jwt(&t.access_token);
                     match fetch_blueprints(acc.character_id, &t.access_token) {
                         Ok(bps) => {
-                            summarise(&acc.name, &bps, &mut out.owned, &mut out.details);
-                            out.synced.push(acc.name.clone());
+                            let jobs = if scopes.iter().any(|s| s == SCOPE_JOBS) {
+                                match fetch_jobs(acc.character_id, &t.access_token) {
+                                    Ok(j) => Some(convert_jobs(&acc.name, &j, &bps)),
+                                    Err(ureq::Error::StatusCode(403)) => {
+                                        out.without_job_scope.push(acc.name.clone());
+                                        Some(Vec::new())
+                                    }
+                                    Err(e) => {
+                                        out.errors.push(format!("{}: industry jobs: {e}", acc.name));
+                                        None
+                                    }
+                                }
+                            } else {
+                                out.without_job_scope.push(acc.name.clone());
+                                Some(Vec::new())
+                            };
+                            if let Some(jobs) = jobs {
+                                summarise(&acc.name, &bps, &mut out.owned, &mut out.details);
+                                // research/copy jobs whose blueprint isn't in the list
+                                for j in &jobs {
+                                    if j.activity.needs_original() && j.from_level.is_none() {
+                                        out.in_jobs_unlisted.push(j.type_id);
+                                    }
+                                }
+                                out.jobs.extend(jobs);
+                                out.synced.push(acc.name.clone());
+                            }
                         }
                         Err(e) => out.errors.push(format!("{}: {e}", acc.name)),
                     }
@@ -484,7 +713,7 @@ mod tests {
     fn authorize_url_is_encoded() {
         let u = authorize_url("st", "ch");
         assert!(u.contains("redirect_uri=http%3A%2F%2Flocalhost%3A51791%2Fcallback"));
-        assert!(u.contains("scope=esi-characters.read_blueprints.v1"));
+        assert!(u.contains("scope=esi-characters.read_blueprints.v1%20esi-industry.read_character_jobs.v1"));
         assert!(u.contains("client_id=397ffb1171354fa6a686dd5c37603d5d"));
         assert!(u.contains("code_challenge_method=S256"));
     }
@@ -513,6 +742,61 @@ mod tests {
         assert_eq!((details[&32881][0].me, details[&32881][0].te), (10, 4), "best ME first");
         assert_eq!(owned[&1153], Owned { qty: 3, me: 0, te: 0 });
         assert!(!owned.contains_key(&691), "copies are ignored");
+    }
+
+    #[test]
+    fn parses_esi_times() {
+        assert_eq!(parse_time("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_time("2026-11-26T10:15:30Z"), Some(1795688130));
+        assert_eq!(format_remaining(2 * 86400 + 3 * 3600 + 59), "2d 3h");
+        assert_eq!(format_remaining(4 * 3600 + 12 * 60), "4h 12m");
+        assert_eq!(format_remaining(30), "<1m");
+    }
+
+    #[test]
+    fn converts_jobs() {
+        let bps: Vec<EsiBlueprint> = serde_json::from_str(
+            r#"[{"item_id":7,"type_id":691,"quantity":-1,"material_efficiency":7,"time_efficiency":12,"runs":-1,"location_id":1,"location_flag":"Hangar"}]"#,
+        )
+        .unwrap();
+        let jobs: Vec<EsiJob> = serde_json::from_str(r#"[
+            {"activity_id":4,"blueprint_id":7,"blueprint_type_id":691,"runs":2,"start_date":"2026-11-26T00:00:00Z","end_date":"2026-11-26T10:00:00Z","status":"active","job_id":1,"installer_id":1,"facility_id":1,"station_id":1,"blueprint_location_id":1,"output_location_id":1,"duration":36000},
+            {"activity_id":3,"blueprint_id":99,"blueprint_type_id":1001,"runs":1,"start_date":"2026-11-26T00:00:00Z","end_date":"2026-11-26T01:00:00Z","status":"ready"},
+            {"activity_id":8,"blueprint_id":5,"blueprint_type_id":1002,"runs":1,"start_date":"2026-11-26T00:00:00Z","end_date":"2026-11-26T01:00:00Z","status":"active"},
+            {"activity_id":4,"blueprint_id":6,"blueprint_type_id":1003,"runs":1,"start_date":"2026-11-20T00:00:00Z","end_date":"2026-11-21T01:00:00Z","status":"delivered"}
+        ]"#).unwrap();
+        let out = convert_jobs("Unan", &jobs, &bps);
+        assert_eq!(out.len(), 2, "invention and delivered jobs are skipped");
+        assert_eq!((out[0].activity, out[0].from_level, out[0].to_level()), (Activity::MeResearch, Some(7), Some(9)));
+        assert_eq!(out[1].from_level, None, "blueprint not in the list");
+        let mid = parse_time("2026-11-26T05:00:00Z").unwrap();
+        assert!((out[0].progress(mid) - 0.5).abs() < 0.01 && out[0].is_running(mid));
+        assert!(out[1].is_ready(mid));
+    }
+
+    #[test]
+    fn research_targets() {
+        let job = |activity, runs, from| Job {
+            character: "x".into(),
+            type_id: 1,
+            activity,
+            runs,
+            from_level: Some(from),
+            start: 0,
+            end: 1,
+            status: "active".into(),
+        };
+        assert_eq!(job(Activity::MeResearch, 2, 7).to_level(), Some(9), "ME: 1% per run");
+        assert_eq!(job(Activity::TeResearch, 5, 4).to_level(), Some(14), "TE: 2% per run");
+        assert_eq!(job(Activity::TeResearch, 5, 16).to_level(), Some(20), "TE caps at 20%");
+    }
+
+    #[test]
+    fn reads_scopes_from_jwt() {
+        let one = URL_SAFE_NO_PAD.encode(br#"{"scp":"esi-characters.read_blueprints.v1"}"#);
+        let two = URL_SAFE_NO_PAD.encode(br#"{"scp":["a","esi-industry.read_character_jobs.v1"]}"#);
+        assert_eq!(scopes_from_jwt(&format!("h.{one}.s")), vec!["esi-characters.read_blueprints.v1"]);
+        assert!(scopes_from_jwt(&format!("h.{two}.s")).iter().any(|s| s == SCOPE_JOBS));
     }
 
     #[test]

@@ -51,6 +51,12 @@ Add more characters the same way and their blueprints are combined.
 - With two or more characters, a picker next to **Sync** shows **All characters** or just the ones you
   tick, without logging anyone out. Cards, totals and group headers then count only those characters'
   originals. Hand-ticked blueprints only appear under All characters, and ownership edits are made there.
+- **Industry jobs:** research, copying and manufacturing jobs show on their card. A soft light sweeps
+  across the card while a job is running. The ME or TE slot shows e.g. **7→9** with a progress bar,
+  and the card says how long is left, or "ready to deliver". The side panel lists each job, and the
+  status filter has an **In industry** option. Blueprints away in a research or copy job stay owned.
+  This needs the `esi-industry.read_character_jobs.v1` permission. Characters that logged in before it
+  was added just need to log in again.
 - Only **originals** count. Copies are ignored.
 - If you own several originals of one blueprint, the card shows the total and the **best** ME/TE.
   The side panel lists every original with its character and ME/TE.
@@ -65,8 +71,8 @@ Characters menu, or revoke access at any time from the third-party applications 
 
 ## Your data
 Saved automatically in `%APPDATA%\EVE BPO Tracker\`: `collection.json` (your progress), `bpos.json`
-(blueprint list), `settings.json` (collapsed groups), `accounts.json` and `sync_details.json`
-(EVE logins and synced originals) and `icons\` (image cache from images.evetech.net). This is the same folder and
+(blueprint list), `settings.json` (collapsed groups), `accounts.json`, `sync_details.json` and `jobs.json`
+(EVE logins, synced originals and industry jobs) and `icons\` (image cache from images.evetech.net). This is the same folder and
 format the earlier Python version used, so existing progress carries over.
 Use *File › Back up collection* occasionally. *Export to CSV* gives you a spreadsheet.
 

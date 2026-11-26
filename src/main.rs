@@ -23,7 +23,7 @@ fn window_icon() -> egui::IconData {
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title(data::APP_NAME)
+            .with_title(format!("{} {}", data::APP_NAME, data::VERSION))
             .with_inner_size([1500.0, 900.0])
             .with_min_inner_size([760.0, 520.0])
             .with_icon(Arc::new(window_icon())),

@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 pub const APP_NAME: &str = "EVE BPO Tracker";
+/// From Cargo.toml at build time.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SDE_URL: &str =
     "https://developers.eveonline.com/static-data/eve-online-static-data-latest-jsonl.zip";
 pub const USER_AGENT: &str = "EVE-BPO-Collection-Tracker/2.0 (personal collection tool)";
@@ -294,7 +296,12 @@ impl Collection {
     /// anything a previous sync marked owned that's no longer there is marked missing.
     /// Manually ticked blueprints, favourites, notes and ignores are left alone.
     /// Returns (newly owned, updated, no longer owned).
-    pub fn apply_sync(&mut self, owned: &HashMap<u32, crate::esi::Owned>) -> (usize, usize, usize) {
+    /// `keep`: blueprint types EVE didn't list because they're in a research or copy job.
+    pub fn apply_sync(
+        &mut self,
+        owned: &HashMap<u32, crate::esi::Owned>,
+        keep: &std::collections::HashSet<u32>,
+    ) -> (usize, usize, usize) {
         let (mut added, mut changed, mut removed) = (0, 0, 0);
         for (id, o) in owned {
             let old = self.get(*id).clone();
@@ -310,7 +317,11 @@ impl Collection {
             }
         }
         let gone: Vec<u32> =
-            self.states.iter().filter(|(id, s)| s.synced && !owned.contains_key(id)).map(|(id, _)| *id).collect();
+            self.states
+            .iter()
+            .filter(|(id, s)| s.synced && !owned.contains_key(id) && !keep.contains(id))
+            .map(|(id, _)| *id)
+            .collect();
         for id in gone {
             if let Some(s) = self.states.get_mut(&id) {
                 s.owned = false;
@@ -679,15 +690,20 @@ mod tests {
         let mut owned = HashMap::new();
         owned.insert(2, Owned { qty: 2, me: 10, te: 20 });
         owned.insert(3, Owned { qty: 1, me: 5, te: 0 });
-        assert_eq!(c.apply_sync(&owned), (2, 0, 0));
+        assert_eq!(c.apply_sync(&owned, &Default::default()), (2, 0, 0));
         assert!(c.get(1).owned && !c.get(1).synced, "manual ticks untouched");
         assert!(c.get(2).fully_researched() && c.get(2).fav && c.get(2).notes == "keep");
         owned.remove(&3);
         owned.insert(2, Owned { qty: 1, me: 10, te: 20 });
-        assert_eq!(c.apply_sync(&owned), (0, 1, 1));
+        assert_eq!(c.apply_sync(&owned, &Default::default()), (0, 1, 1));
         assert!(!c.get(3).owned, "sold/moved blueprints drop out");
         assert!(c.get(1).owned, "still untouched");
-        assert_eq!(c.apply_sync(&owned), (0, 0, 0));
+        assert_eq!(c.apply_sync(&owned, &Default::default()), (0, 0, 0));
+        // a blueprint away in a research job isn't listed by EVE, but is still owned
+        owned.remove(&2);
+        let keep = [2u32].into_iter().collect();
+        assert_eq!(c.apply_sync(&owned, &keep), (0, 0, 0));
+        assert!(c.get(2).owned);
     }
 
     #[test]

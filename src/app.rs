@@ -20,7 +20,7 @@ const CELL_H: f32 = CARD_H + GAP;
 const HEADER_H: f32 = 52.0;
 const SLOT_SIZE: f32 = 50.0;
 
-const STATUS: [&str; 8] = [
+const STATUS: [&str; 9] = [
     "Any status",
     "Missing",
     "Owned",
@@ -29,6 +29,7 @@ const STATUS: [&str; 8] = [
     "Duplicates (qty > 1)",
     "Favourites",
     "Ignored",
+    "In industry (research, copying…)",
 ];
 const MARKET: [&str; 3] = ["Market + non-market", "Market listed only", "Not on market only"];
 const SORT: [&str; 4] = ["Sort: Name", "Sort: Group", "Sort: Missing first", "Sort: Owned first"];
@@ -49,6 +50,7 @@ enum Dialog {
     FirstRun,
     Message { title: String, body: String },
     ConfirmRestore(PathBuf),
+    About,
 }
 
 #[derive(Clone, PartialEq)]
@@ -96,6 +98,8 @@ pub struct TrackerApp {
     sync_manual: bool,
     sync_status: String,
     sync_failed: bool,
+    jobs: Vec<esi::Job>,
+    animating: bool,
     started_sync: bool,
     ctx: Option<egui::Context>,
 }
@@ -150,11 +154,14 @@ impl TrackerApp {
             sync_manual: false,
             sync_status: String::new(),
             sync_failed: false,
+            jobs: Vec::new(),
+            animating: false,
             started_sync: false,
             ctx: None,
         };
         app.accounts = esi::load_accounts(&esi::accounts_path(&app.dir));
         app.details = esi::load_details(&esi::details_path(&app.dir));
+        app.jobs = esi::load_jobs(&esi::jobs_path(&app.dir));
         app.load_settings();
         if let Some(out) = std::env::var_os("BPO_SCREENSHOT") {
             let num = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
@@ -164,6 +171,9 @@ impl TrackerApp {
             app.f.status = num("BPO_TEST_STATUS").unwrap_or(0);
             app.selected = num("BPO_TEST_SELECT").map(|v| v as u32);
             app.f.search = std::env::var("BPO_TEST_SEARCH").unwrap_or_default();
+            if std::env::var_os("BPO_TEST_ABOUT").is_some() {
+                app.dialog = Dialog::About;
+            }
             if let Ok(c) = std::env::var("BPO_TEST_CHARS") {
                 app.f.chars = Some(c.split(',').map(str::to_string).collect());
             }
@@ -229,8 +239,11 @@ impl TrackerApp {
                 // Only apply when every character synced, so a temporary error can't
                 // mark another character's blueprints as missing.
                 if r.errors.is_empty() {
-                    let (added, changed, removed) = self.coll.apply_sync(&r.owned);
+                    let keep: std::collections::HashSet<u32> = r.in_jobs_unlisted.iter().copied().collect();
+                    let (added, changed, removed) = self.coll.apply_sync(&r.owned, &keep);
                     self.details = r.details;
+                    self.jobs = r.jobs;
+                    esi::save_jobs(&esi::jobs_path(&self.dir), &self.jobs);
                     esi::save_details(&esi::details_path(&self.dir), &self.details);
                     self.coll.save();
                     self.refilter_if_needed(true);
@@ -239,6 +252,10 @@ impl TrackerApp {
                         parts.push(format!("{removed} no longer owned"));
                     }
                     self.sync_status = format!("Synced {} · {}", now_hhmm(), parts.join(", "));
+                    if !r.without_job_scope.is_empty() {
+                        self.sync_status +=
+                            &format!(" · log in again to track research: {}", r.without_job_scope.join(", "));
+                    }
                 } else {
                     self.sync_failed = true;
                     self.sync_status = "Sync incomplete, nothing changed".into();
@@ -419,6 +436,7 @@ impl TrackerApp {
             5 => s.qty > 1,
             6 => s.fav,
             7 => s.ignored,
+            8 => !self.jobs_for(e.id).is_empty(),
             _ => true,
         }
     }
@@ -600,6 +618,12 @@ impl TrackerApp {
                 }
             });
             ui.menu_button("Characters", |ui| self.characters_menu(ui));
+            ui.menu_button("Help", |ui| {
+                if ui.button("About EVE BPO Tracker").clicked() {
+                    self.dialog = Dialog::About;
+                    ui.close();
+                }
+            });
         });
     }
 
@@ -621,6 +645,17 @@ impl TrackerApp {
         s.te = te;
         s.synced = s.owned;
         s
+    }
+
+    /// Industry jobs using this blueprint, for the characters in view. Soonest first.
+    fn jobs_for(&self, id: u32) -> Vec<&esi::Job> {
+        let mut v: Vec<&esi::Job> = self
+            .jobs
+            .iter()
+            .filter(|j| j.type_id == id && self.f.chars.as_ref().is_none_or(|c| c.contains(&j.character)))
+            .collect();
+        v.sort_by_key(|j| j.end);
+        v
     }
 
     fn character_view_active(&self) -> bool {
@@ -667,6 +702,16 @@ impl TrackerApp {
             ui.label(RichText::new(format!("/ {counted} owned ({pct:.1}%)")).color(MUTED));
             ui.label(RichText::new("·").color(MUTED));
             ui.label(RichText::new(format!("{full} fully researched")).color(GOLD));
+            let in_industry: BTreeSet<u32> = self
+                .jobs
+                .iter()
+                .filter(|j| self.f.chars.as_ref().is_none_or(|c| c.contains(&j.character)))
+                .map(|j| j.type_id)
+                .collect();
+            if !in_industry.is_empty() {
+                ui.label(RichText::new("·").color(MUTED));
+                ui.label(RichText::new(format!("{} in industry", in_industry.len())).color(GOLD_PALE));
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if self.accounts.is_empty() {
                     if ui.button("Log in with EVE").on_hover_text("Fill in your collection from your characters' blueprints").clicked() {
@@ -769,6 +814,7 @@ impl TrackerApp {
             });
             return;
         }
+        self.animating = false;
         let width = ui.available_width();
         let cols = ((width + 2.0) / CELL_W).floor().max(1.0) as usize;
         let rows = self.layout_rows(cols);
@@ -813,6 +859,9 @@ impl TrackerApp {
         );
         for (id, edit) in edits {
             self.coll.edit(id, edit);
+        }
+        if self.animating {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
         }
         if select.is_some() {
             self.selected = select;
@@ -913,6 +962,11 @@ impl TrackerApp {
         let researched = s.fully_researched();
         let selected = self.selected == Some(id);
         let can_edit = !self.character_view_active();
+        let now = esi::now_unix();
+        let jobs: Vec<esi::Job> = self.jobs_for(id).into_iter().cloned().collect();
+        let running = jobs.iter().any(|j| j.is_running(now));
+        // (screenshot tests jump ahead so the sweep is mid-card)
+        let anim_t = ui.input(|i| i.time) as f32 + if self.test.is_some() { 2.6 } else { 0.0 };
 
         let base = ui.scope_id().with(("card", id));
         let card_resp = ui.interact(rect, base, Sense::click());
@@ -994,6 +1048,10 @@ impl TrackerApp {
             BORDER
         };
         p.rect_filled(rect, 10, if s.owned { CARD_OWNED } else { CHARCOAL });
+        if running {
+            paint_sweep(&ui.painter_at(rect.shrink(1.0)), rect, anim_t);
+            self.animating = true;
+        }
         p.rect_stroke(rect, 10, Stroke::new(if selected || researched { 2.0 } else { 1.2 }, border), StrokeKind::Inside);
 
         // header
@@ -1016,15 +1074,42 @@ impl TrackerApp {
         // slots
         Self::slot(&p, bpo_r, "BPO", if s.owned { "✓" } else { "—" }, s.owned, false, None, (s.qty > 1).then(|| s.qty.to_string()));
         if e.researchable {
-            Self::slot(&p, me_r, "ME", &s.me.to_string(), s.owned && s.me > 0, s.owned && s.me >= ME_MAX,
-                Some(if s.owned { s.me as f32 / ME_MAX as f32 } else { 0.0 }), None);
-            Self::slot(&p, te_r, "TE", &s.te.to_string(), s.owned && s.te > 0, s.owned && s.te >= TE_MAX,
-                Some(if s.owned { s.te as f32 / TE_MAX as f32 } else { 0.0 }), None);
+            // While research is running, the slot shows "from → to" and the bar shows job progress.
+            let research = |act: esi::Activity, cur: u8| {
+                jobs.iter().find(|j| j.activity == act).map(|j| {
+                    let from = j.from_level.unwrap_or(cur);
+                    let to = j.to_level().unwrap_or(from);
+                    (format!("{from}→{to}"), j.progress(now))
+                })
+            };
+            match research(esi::Activity::MeResearch, s.me) {
+                Some((txt, prog)) => Self::slot(&p, me_r, "ME", &txt, true, false, Some(prog), None),
+                None => Self::slot(&p, me_r, "ME", &s.me.to_string(), s.owned && s.me > 0, s.owned && s.me >= ME_MAX,
+                    Some(if s.owned { s.me as f32 / ME_MAX as f32 } else { 0.0 }), None),
+            }
+            match research(esi::Activity::TeResearch, s.te) {
+                Some((txt, prog)) => Self::slot(&p, te_r, "TE", &txt, true, false, Some(prog), None),
+                None => Self::slot(&p, te_r, "TE", &s.te.to_string(), s.owned && s.te > 0, s.owned && s.te >= TE_MAX,
+                    Some(if s.owned { s.te as f32 / TE_MAX as f32 } else { 0.0 }), None),
+            }
         }
         let info_w = rect.right() - sx - 12.0;
         p.text(pos2(sx, y + 118.0), Align2::LEFT_CENTER, elide(&p, &e.group, font(11.5), info_w), font(11.5), MUTED);
-        let tech = if e.market { e.tech.clone() } else { format!("{}  ·  not on market", e.tech) };
-        p.text(pos2(sx, y + 134.0), Align2::LEFT_CENTER, tech, font(11.5), MUTED);
+        if let Some(j) = jobs.first() {
+            // Industry status replaces the tech line while a job is on.
+            let (txt, col) = if j.is_ready(now) {
+                (format!("{} ready to deliver", j.activity.label()), GOLD)
+            } else if j.status == "paused" {
+                (format!("{} paused", j.activity.label()), MUTED)
+            } else {
+                (format!("{} · {}", j.activity.label(), esi::format_remaining(j.end - now)), GOLD_PALE)
+            };
+            let txt = if jobs.len() > 1 { format!("{txt}  +{}", jobs.len() - 1) } else { txt };
+            p.text(pos2(sx, y + 134.0), Align2::LEFT_CENTER, elide(&p, &txt, font_bold(11.5), info_w), font_bold(11.5), col);
+        } else {
+            let tech = if e.market { e.tech.clone() } else { format!("{}  ·  not on market", e.tech) };
+            p.text(pos2(sx, y + 134.0), Align2::LEFT_CENTER, tech, font(11.5), MUTED);
+        }
 
         // footer
         let fy = rect.bottom() - 21.0;
@@ -1126,6 +1211,33 @@ impl TrackerApp {
                 l.iter().filter(|d| self.f.chars.as_ref().is_none_or(|c| c.contains(&d.character))).cloned().collect()
             })
             .unwrap_or_default();
+        let jobs: Vec<esi::Job> = self.jobs_for(e.id).into_iter().cloned().collect();
+        if !jobs.is_empty() {
+            let now = esi::now_unix();
+            ui.label(RichText::new("In industry").font(font_bold(14.0)));
+            egui::Frame::new().fill(GROUND).corner_radius(6).inner_margin(8).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                for j in &jobs {
+                    let levels = match (j.activity, j.from_level, j.to_level()) {
+                        (esi::Activity::MeResearch | esi::Activity::TeResearch, Some(f), Some(t)) => format!(" {f} → {t}"),
+                        (esi::Activity::MeResearch | esi::Activity::TeResearch, _, _) => format!(" +{} levels", j.runs),
+                        (_, _, _) => format!(" ×{}", j.runs),
+                    };
+                    ui.label(RichText::new(format!("{}{levels}", j.activity.label())).color(GOLD_PALE));
+                    let when = if j.is_ready(now) {
+                        "Ready to deliver".to_string()
+                    } else if j.status == "paused" {
+                        "Paused".to_string()
+                    } else {
+                        format!("{} left", esi::format_remaining(j.end - now))
+                    };
+                    ui.label(RichText::new(format!("{} · {when}", j.character)).color(MUTED).font(font(11.5)));
+                    ui.add(egui::ProgressBar::new(j.progress(now)).fill(if j.is_ready(now) { GOLD } else { GOLD_PALE }).desired_height(4.0));
+                    ui.add_space(4.0);
+                }
+            });
+            ui.add_space(8.0);
+        }
         if !list.is_empty() {
             let total: u32 = list.iter().map(|d| d.count).sum();
             ui.label(RichText::new(format!("In EVE: {total} original{}", if total == 1 { "" } else { "s" })).font(font_bold(14.0)));
@@ -1310,6 +1422,39 @@ impl TrackerApp {
                 });
                 close = r.inner || r.should_close();
             }
+            Dialog::About => {
+                let mut open_folder = false;
+                let r = egui::Modal::new(egui::Id::unique("about")).show(ctx, |ui| {
+                    ui.set_width(400.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(data::APP_NAME).font(font_bold(18.0)));
+                        ui.label(RichText::new(format!("v{}", data::VERSION)).font(font_bold(14.0)).color(GOLD));
+                    });
+                    ui.label(RichText::new("by Solus Interactive").color(MUTED));
+                    ui.add_space(8.0);
+                    ui.label("Track your EVE Online blueprint original collection.");
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(format!("Data folder: {}", self.dir.display())).color(MUTED).font(font(11.5)));
+                    ui.label(
+                        RichText::new("Game data and images © CCP hf. UI font: Inter (SIL Open Font License).")
+                            .color(MUTED)
+                            .font(font(11.5)),
+                    );
+                    ui.add_space(10.0);
+                    let mut close = false;
+                    ui.horizontal(|ui| {
+                        if ui.button("Open data folder").clicked() {
+                            open_folder = true;
+                        }
+                        close = ui.button("Close").clicked();
+                    });
+                    close
+                });
+                if open_folder {
+                    self.open_data_folder();
+                }
+                close = r.inner || r.should_close();
+            }
             Dialog::ConfirmRestore(path) => {
                 let path = path.clone();
                 let mut answer = None;
@@ -1474,4 +1619,32 @@ fn now_hhmm() -> String {
     // Local time isn't in std; UTC matches EVE time, which players know well.
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     format!("{:02}:{:02} EVE", (secs / 3600) % 24, (secs / 60) % 60)
+}
+
+/// A soft diagonal band of light that sweeps across a card while one of its jobs is running.
+fn paint_sweep(p: &egui::Painter, rect: Rect, t: f32) {
+    let band = 140.0;
+    let skew = 70.0;
+    let travel = rect.width() + band + skew * 2.0;
+    let x0 = rect.left() - band - skew + (t * 110.0) % (travel + 160.0); // pause a beat between passes
+    let (top, bot) = (rect.top(), rect.bottom());
+    let clear = Color32::TRANSPARENT;
+    let glow = Color32::from_rgba_unmultiplied(0xFF, 0xD2, 0x7A, 26);
+    let mut mesh = egui::Mesh::default();
+    let pts = [
+        (pos2(x0 + skew, top), clear),
+        (pos2(x0, bot), clear),
+        (pos2(x0 + band / 2.0 + skew, top), glow),
+        (pos2(x0 + band / 2.0, bot), glow),
+        (pos2(x0 + band + skew, top), clear),
+        (pos2(x0 + band, bot), clear),
+    ];
+    for (pos, color) in pts {
+        mesh.colored_vertex(pos, color);
+    }
+    mesh.add_triangle(0, 1, 3);
+    mesh.add_triangle(0, 3, 2);
+    mesh.add_triangle(2, 3, 5);
+    mesh.add_triangle(2, 5, 4);
+    p.add(egui::Shape::mesh(mesh));
 }
