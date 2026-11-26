@@ -54,7 +54,7 @@ Add more characters the same way and their blueprints are combined.
 - **Industry jobs:** research, copying and manufacturing jobs show on their card. A soft light sweeps
   across the card while a job is running. The ME or TE slot shows e.g. **7→9** with a progress bar,
   and the card says how long is left, or "ready to deliver". The side panel lists each job, and the
-  status filter has an **In industry** option. Blueprints away in a research or copy job stay owned.
+  status filter has **Researching (ME/TE)** and **In industry (any job)** options. Blueprints away in a research or copy job stay owned.
   This needs the `esi-industry.read_character_jobs.v1` permission. Characters that logged in before it
   was added just need to log in again.
 - Only **originals** count. Copies are ignored.

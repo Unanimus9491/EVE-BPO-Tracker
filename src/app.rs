@@ -20,7 +20,7 @@ const CELL_H: f32 = CARD_H + GAP;
 const HEADER_H: f32 = 52.0;
 const SLOT_SIZE: f32 = 50.0;
 
-const STATUS: [&str; 9] = [
+const STATUS: [&str; 10] = [
     "Any status",
     "Missing",
     "Owned",
@@ -29,7 +29,8 @@ const STATUS: [&str; 9] = [
     "Duplicates (qty > 1)",
     "Favourites",
     "Ignored",
-    "In industry (research, copying…)",
+    "Researching (ME/TE)",
+    "In industry (any job)",
 ];
 const MARKET: [&str; 3] = ["Market + non-market", "Market listed only", "Not on market only"];
 const SORT: [&str; 4] = ["Sort: Name", "Sort: Group", "Sort: Missing first", "Sort: Owned first"];
@@ -436,7 +437,11 @@ impl TrackerApp {
             5 => s.qty > 1,
             6 => s.fav,
             7 => s.ignored,
-            8 => !self.jobs_for(e.id).is_empty(),
+            8 => self
+                .jobs_for(e.id)
+                .iter()
+                .any(|j| matches!(j.activity, esi::Activity::MeResearch | esi::Activity::TeResearch)),
+            9 => !self.jobs_for(e.id).is_empty(),
             _ => true,
         }
     }
@@ -936,7 +941,12 @@ impl TrackerApp {
         p.rect_stroke(r, 9, Stroke::new(1.4, border), StrokeKind::Inside);
         p.text(pos2(r.center().x, r.top() + 10.0), Align2::CENTER_CENTER, label, font(10.5), if lit || maxed { TEXT } else { MUTED });
         let vc = if maxed { GOLD } else if lit { TEXT } else { MUTED };
-        p.text(pos2(r.center().x, r.top() + 28.0), Align2::CENTER_CENTER, value, font_bold(14.0), vc);
+        // Shrink long values like "10→20" so they stay clear of the slot edges.
+        let size = [14.0, 12.5, 11.0]
+            .into_iter()
+            .find(|sz| p.layout_no_wrap(value.to_string(), font_bold(*sz), vc).size().x <= r.width() - 10.0)
+            .unwrap_or(10.0);
+        p.text(pos2(r.center().x, r.top() + 28.0), Align2::CENTER_CENTER, value, font_bold(size), vc);
         if let Some(frac) = frac {
             let bar = Rect::from_min_size(pos2(r.left() + 7.0, r.bottom() - 9.0), vec2(r.width() - 14.0, 4.0));
             p.rect_filled(bar, 1, Color32::from_black_alpha(120));
