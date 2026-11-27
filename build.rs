@@ -5,9 +5,9 @@ fn main() {
     {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("assets/icon.ico");
-        res.set("ProductName", "EVE BPO Tracker");
-        res.set("FileDescription", "EVE BPO Tracker");
-        res.set("CompanyName", "Solus Interactive");
+        res.set("ProductName", "Slipway");
+        res.set("FileDescription", "Slipway: Industry & Blueprint Suite");
+        res.set("CompanyName", "Unanimus");
         if let Err(e) = res.compile() {
             // Don't fail the build over an icon.
             println!("cargo:warning=Couldn't embed the app icon: {e}");

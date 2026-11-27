@@ -995,23 +995,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eve-bpo-tracker"
-version = "0.4.0"
-dependencies = [
- "base64",
- "eframe",
- "getrandom 0.4.3",
- "image",
- "rfd",
- "serde",
- "serde_json",
- "sha2",
- "ureq",
- "winresource",
- "zip",
-]
-
-[[package]]
 name = "event-listener"
 version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2699,6 +2682,23 @@ name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
+
+[[package]]
+name = "slipway"
+version = "0.5.0"
+dependencies = [
+ "base64",
+ "eframe",
+ "getrandom 0.4.3",
+ "image",
+ "rfd",
+ "serde",
+ "serde_json",
+ "sha2",
+ "ureq",
+ "winresource",
+ "zip",
+]
 
 [[package]]
 name = "slotmap"

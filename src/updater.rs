@@ -11,8 +11,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-pub const REPO: &str = "Unanimus9491/EVE-BPO-Tracker";
-pub const ASSET_NAME: &str = "EVE-BPO-Tracker.exe";
+pub const REPO: &str = "Unanimus9491/Slipway";
+pub const ASSET_NAME: &str = "Slipway.exe";
 
 pub fn releases_page() -> String {
     format!("https://github.com/{REPO}/releases/latest")
@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn picks_release_asset() {
         let json = r#"{"tag_name":"v0.4.0","body":"New stuff","draft":false,"prerelease":false,
-            "assets":[{"name":"EVE-BPO-Tracker.exe","browser_download_url":"https://github.com/x/y/releases/download/v0.4.0/EVE-BPO-Tracker.exe","size":1234}]}"#;
+            "assets":[{"name":"Slipway.exe","browser_download_url":"https://github.com/x/y/releases/download/v0.4.0/Slipway.exe","size":1234}]}"#;
         let u = pick_update(json, "0.3.2").unwrap().unwrap();
         assert_eq!((u.version.as_str(), u.size, u.notes.as_str()), ("0.4.0", 1234, "New stuff"));
         assert!(pick_update(json, "0.4.0").unwrap().is_none(), "same version");
@@ -274,7 +274,7 @@ mod tests {
                 let _ = s.write_all(&body);
             }
         });
-        format!("http://127.0.0.1:{port}/EVE-BPO-Tracker.exe")
+        format!("http://127.0.0.1:{port}/Slipway.exe")
     }
 
     #[test]
@@ -282,7 +282,7 @@ mod tests {
         let dir = std::env::temp_dir().join("bpo-test-update");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let exe = dir.join("EVE-BPO-Tracker.exe");
+        let exe = dir.join("Slipway.exe");
         std::fs::write(&exe, b"MZ old version").unwrap();
         let body = b"MZ new version!".to_vec();
         let info = UpdateInfo { version: "9.9.9".into(), notes: String::new(), url: serve_once(body.clone()), size: body.len() as u64 };
@@ -299,7 +299,7 @@ mod tests {
         let dir = std::env::temp_dir().join("bpo-test-update-bad");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let exe = dir.join("EVE-BPO-Tracker.exe");
+        let exe = dir.join("Slipway.exe");
         std::fs::write(&exe, b"MZ old version").unwrap();
         let body = b"<html>not an exe</html>".to_vec();
         let info = UpdateInfo { version: "9.9.9".into(), notes: String::new(), url: serve_once(body.clone()), size: body.len() as u64 };
@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn swap_paths() {
-        let exe = Path::new(r"C:\Tools\EVE-BPO-Tracker.exe");
-        assert_eq!(old_path(exe), Path::new(r"C:\Tools\EVE-BPO-Tracker.exe.old"));
+        let exe = Path::new(r"C:\Tools\Slipway.exe");
+        assert_eq!(old_path(exe), Path::new(r"C:\Tools\Slipway.exe.old"));
     }
 }

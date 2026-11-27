@@ -10,12 +10,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-pub const APP_NAME: &str = "EVE BPO Tracker";
+pub const APP_NAME: &str = "Slipway";
+pub const APP_TAGLINE: &str = "Industry & Blueprint Suite";
+/// Data folder name used before the rename to Slipway. Moved to the new name on first run.
+const LEGACY_DIR_NAME: &str = "EVE BPO Tracker";
 /// From Cargo.toml at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const SDE_URL: &str =
     "https://developers.eveonline.com/static-data/eve-online-static-data-latest-jsonl.zip";
-pub const USER_AGENT: &str = "EVE-BPO-Collection-Tracker/2.0 (personal collection tool)";
+pub const USER_AGENT: &str = "Slipway/0.5 (github.com/Unanimus9491/Slipway)";
 pub const ME_MAX: u8 = 10;
 pub const TE_MAX: u8 = 20;
 
@@ -23,7 +26,7 @@ pub const TABS: [&str; 9] = [
     "All", "Ships", "Modules", "Charges", "Drones", "Structures", "Components", "Reactions", "Other",
 ];
 
-/// Product category (from the SDE) -> tab in the tracker.
+/// Product category (from the SDE) -> tab in the blueprint collection.
 pub fn tab_for(kind: &str, category: &str) -> &'static str {
     if kind == "reaction" {
         return "Reactions";
@@ -70,6 +73,28 @@ pub const SHIP_TREE_ORDER: &[&str] = &[
     "Industrial Command Ship", "Capital Industrial Ship",
 ];
 
+/// Market groups that are too broad to be a section on their own, so they're split one
+/// level deeper (e.g. Turrets & Launchers -> Missile Launchers, Hybrid Turrets, …;
+/// Components -> Advanced Components, Capital Components, R.A.M., …).
+pub const SPLIT_SECTIONS: &[&str] = &["Turrets & Launchers", "Rigs", "Components"];
+
+/// The header a blueprint is listed under in group view. Ships keep their hull group
+/// (they follow the ship tree) and reactions keep theirs; everything else uses the
+/// in-game market tree, so e.g. light, heavy, auto-targeting and assault missiles all
+/// sit under one "Missiles" section rather than a section each.
+/// Falls back to the item group when there's no market path (unlisted items, older data).
+pub fn section_for(e: &Entry) -> String {
+    if e.category == "Ship" || e.kind == "reaction" {
+        return e.group.clone();
+    }
+    // market_path[0] is the top level (e.g. "Ammunition & Charges"), [1] the section.
+    match e.market_path.get(1) {
+        Some(s) if SPLIT_SECTIONS.contains(&s.as_str()) => e.market_path.get(2).unwrap_or(s).clone(),
+        Some(s) => s.clone(),
+        None => e.group.clone(),
+    }
+}
+
 /// Sort position of a group: ship groups follow the ship tree, everything else is alphabetical.
 pub fn group_rank(category: &str, group: &str) -> usize {
     if category == "Ship" {
@@ -105,6 +130,15 @@ pub fn data_dir() -> PathBuf {
     }
     .unwrap_or_else(|| PathBuf::from("."));
     let dir = base.join(APP_NAME);
+    let legacy = base.join(LEGACY_DIR_NAME);
+    if !dir.exists() && legacy.is_dir() {
+        // Carry existing progress over from the pre-rename folder. If the move fails
+        // (e.g. the folder is open elsewhere), keep using the old one so nothing is lost.
+        if fs::rename(&legacy, &dir).is_err() {
+            let _ = fs::create_dir_all(legacy.join("icons"));
+            return legacy;
+        }
+    }
     let _ = fs::create_dir_all(dir.join("icons"));
     dir
 }
@@ -141,6 +175,12 @@ pub struct Entry {
     pub kind: String,
     #[serde(default = "yes")]
     pub researchable: bool,
+    /// The product's place in the in-game market tree, top level first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub market_path: Vec<String>,
+    /// Header in group view; worked out on load (see `section_for`), not saved.
+    #[serde(skip)]
+    pub section: String,
 }
 fn yes() -> bool {
     true
@@ -162,6 +202,7 @@ pub fn load_entries(path: &Path) -> Option<Vec<Entry>> {
     for e in &mut entries {
         // Apply current tab rules, so changes don't need a data rebuild.
         e.tab = tab_for(&e.kind, &e.category).to_string();
+        e.section = section_for(e);
     }
     Some(entries)
 }
@@ -422,11 +463,35 @@ struct TypeRow {
     techLevel: Option<u32>,
 }
 
+#[derive(Deserialize)]
+#[allow(non_snake_case)]
+struct MarketGroupRow {
+    _key: u32,
+    name: Option<Name>,
+    parentGroupID: Option<u32>,
+}
+
+/// Market group names from the top level down to `id`.
+fn market_path(id: Option<u32>, groups: &HashMap<u32, (String, Option<u32>)>) -> Vec<String> {
+    let mut path = Vec::new();
+    let mut cur = id;
+    while let Some((name, parent)) = cur.and_then(|g| groups.get(&g)) {
+        path.push(name.clone());
+        cur = *parent;
+        if path.len() > 16 {
+            break; // guard against a loop in bad data
+        }
+    }
+    path.reverse();
+    path
+}
+
 struct TypeInfo {
     name: String,
     group_id: Option<u32>,
     published: bool,
     market: bool,
+    market_group: Option<u32>,
     meta_group: Option<u32>,
     tech_level: Option<u32>,
 }
@@ -495,6 +560,17 @@ pub fn build_dataset(zip_path: &Path, p: &Progress) -> Result<Vec<Entry>, String
     })
     .map_err(io)?;
 
+    // Optional: without it, sections fall back to item groups.
+    let mut market_groups: HashMap<u32, (String, Option<u32>)> = HashMap::new();
+    if let Ok(f) = open_jsonl(&mut zip, "marketGroups.jsonl") {
+        for_each_line(f, |l| {
+            if let Ok(r) = serde_json::from_str::<MarketGroupRow>(l) {
+                market_groups.insert(r._key, (r.name.map(Name::en).unwrap_or_default(), r.parentGroupID));
+            }
+        })
+        .map_err(io)?;
+    }
+
     report(p, "Reading item types…", 2, 5);
     let mut types: HashMap<u32, TypeInfo> = HashMap::new();
     for_each_line(open_jsonl(&mut zip, "types.jsonl")?, |l| {
@@ -506,6 +582,7 @@ pub fn build_dataset(zip_path: &Path, p: &Progress) -> Result<Vec<Entry>, String
                     group_id: r.groupID,
                     published: r.published,
                     market: r.marketGroupID.is_some(),
+                    market_group: r.marketGroupID,
                     meta_group: r.metaGroupID,
                     tech_level: r.techLevel,
                 },
@@ -541,7 +618,7 @@ pub fn build_dataset(zip_path: &Path, p: &Progress) -> Result<Vec<Entry>, String
                 let tl = prod.and_then(|t| t.tech_level).unwrap_or(1).clamp(1, 3);
                 format!("Tech {}", ["I", "II", "III"][tl as usize - 1])
             });
-        out.push(Entry {
+        let mut e = Entry {
             id: bp._key,
             name: bpt.name.clone(),
             product_id: prod_id,
@@ -554,7 +631,11 @@ pub fn build_dataset(zip_path: &Path, p: &Progress) -> Result<Vec<Entry>, String
             kind: kind.to_string(),
             researchable: bp.activities.contains_key("research_material")
                 || bp.activities.contains_key("research_time"),
-        });
+            market_path: market_path(prod.and_then(|t| t.market_group), &market_groups),
+            section: String::new(),
+        };
+        e.section = section_for(&e);
+        out.push(e);
     })
     .map_err(io)?;
     report(p, "Done", 5, 5);
@@ -600,7 +681,7 @@ pub fn spawn_build(zip_path: Option<PathBuf>, ctx: eframe::egui::Context) -> Pro
         let result = match zip_path {
                 Some(path) => build_dataset(&path, &p),
                 None => {
-                    let tmp = std::env::temp_dir().join("eve-bpo-tracker-sde.zip");
+                    let tmp = std::env::temp_dir().join("slipway-sde.zip");
                     let r = download_sde(&tmp, &p).and_then(|_| build_dataset(&tmp, &p));
                     let _ = fs::remove_file(&tmp);
                     r
@@ -725,6 +806,39 @@ mod tests {
         frig.sort_by_key(|g| group_rank("Ship", g));
         assert_eq!(frig, ["Interceptor", "Assault Frigate", "Covert Ops", "Electronic Attack Ship", "Logistics Frigate"]);
         assert_eq!(group_rank("Module", "Anything"), 0);
+    }
+
+    #[test]
+    fn sections_follow_market_tree() {
+        let entry = |category: &str, group: &str, path: &[&str]| Entry {
+            id: 1,
+            name: String::new(),
+            product_id: 1,
+            product_name: String::new(),
+            tab: String::new(),
+            category: category.into(),
+            group: group.into(),
+            tech: String::new(),
+            market: true,
+            kind: "manufacturing".into(),
+            researchable: true,
+            market_path: path.iter().map(|s| s.to_string()).collect(),
+            section: String::new(),
+        };
+        let charges = ["Ammunition & Charges", "Missiles", "Auto-Targeting Missiles", "Light Auto-Targeting"];
+        assert_eq!(section_for(&entry("Charge", "Auto-Targeting Missile", &charges)), "Missiles");
+        let launcher = ["Ship Equipment", "Turrets & Launchers", "Missile Launchers", "Light Missile Launchers"];
+        assert_eq!(section_for(&entry("Module", "Missile Launcher Light", &launcher)), "Missile Launchers");
+        // ships keep the hull group; no market path falls back to the item group
+        assert_eq!(section_for(&entry("Ship", "Frigate", &["Ships", "Frigates"])), "Frigate");
+        assert_eq!(section_for(&entry("Module", "Odd Thing", &[])), "Odd Thing");
+
+        let mut g = HashMap::new();
+        g.insert(1, ("Ammunition & Charges".to_string(), None));
+        g.insert(2, ("Missiles".to_string(), Some(1)));
+        g.insert(3, ("Light Missiles".to_string(), Some(2)));
+        assert_eq!(market_path(Some(3), &g), ["Ammunition & Charges", "Missiles", "Light Missiles"]);
+        assert!(market_path(None, &g).is_empty());
     }
 
     #[test]

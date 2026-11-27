@@ -221,7 +221,7 @@ fn run_login(url: &str, csrf: &str, verifier: &str, cancel: &AtomicBool) -> Resu
     }
     if listeners.is_empty() {
         return Err(format!(
-            "Couldn't listen on port {CALLBACK_PORT} for the login result. Is another copy of the tracker open?"
+            "Couldn't listen on port {CALLBACK_PORT} for the login result. Is another copy of Slipway open?"
         ));
     }
     open_in_browser(url);
@@ -294,11 +294,11 @@ fn handle_callback(mut stream: TcpStream, csrf: &str) -> Option<Result<String, S
             .unwrap_or_else(|| "Login was cancelled.".into()))
     };
     let (title, msg) = match &result {
-        Ok(_) => ("Logged in", "You can close this tab and go back to the tracker."),
-        Err(_) => ("Login failed", "Go back to the tracker for details."),
+        Ok(_) => ("Logged in", "You can close this tab and go back to Slipway."),
+        Err(_) => ("Login failed", "Go back to Slipway for details."),
     };
     let html = format!(
-        "<!DOCTYPE html><html><head><meta charset=utf-8><title>EVE BPO Tracker</title></head>\
+        "<!DOCTYPE html><html><head><meta charset=utf-8><title>Slipway</title></head>\
          <body style=\"margin:0;height:100vh;display:flex;align-items:center;justify-content:center;\
          background:#181615;color:#ece6dc;font-family:Segoe UI,Inter,sans-serif\">\
          <div style=\"background:#232120;border:1px solid #34302d;border-radius:12px;padding:32px 40px;text-align:center\">\
@@ -546,7 +546,7 @@ fn fetch_jobs(character_id: u64, access_token: &str) -> Result<Vec<EsiJob>, ureq
     serde_json::from_str(&text).map_err(|e| ureq::Error::Other(Box::new(e)))
 }
 
-/// Turns ESI jobs into tracker jobs, filling in the starting ME/TE from the blueprint list.
+/// Turns ESI jobs into Slipway jobs, filling in the starting ME/TE from the blueprint list.
 fn convert_jobs(character: &str, jobs: &[EsiJob], bps: &[EsiBlueprint]) -> Vec<Job> {
     let levels: HashMap<u64, (u8, u8)> = bps
         .iter()

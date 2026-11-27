@@ -1,20 +1,21 @@
-# EVE BPO Collection Tracker
+# Slipway: Industry & Blueprint Suite
 
-An AlecaFrame-style card grid for collecting every Blueprint Original (BPO) in EVE Online.
+Industry and blueprint tools for EVE Online, starting with an AlecaFrame-style card grid for collecting
+every Blueprint Original (BPO). Formerly *EVE BPO Tracker*.
 It's a single Windows `.exe` written in Rust, and it doesn't need anything else installed.
 
 ## Getting the exe
 GitHub Actions builds the exe every time you push to `main`:
 
 1. Open the repo's **Actions** tab and pick the latest **Build Windows exe** run.
-2. Download the **EVE-BPO-Tracker** artifact. It's a zip that contains `EVE-BPO-Tracker.exe`.
+2. Download the **Slipway** artifact. It's a zip that contains `Slipway.exe`.
 
 To publish a proper release, push a version tag (`git tag v0.2.0`, then `git push --tags`).
 The exe is then attached to a GitHub Release.
 
 ### Building it yourself
 Install Rust from https://rustup.rs, then run `cargo build --release` in this folder.
-The exe ends up at `target/release/eve-bpo-tracker.exe`.
+The exe ends up at `target/release/slipway.exe`.
 
 ## First run
 Click **Download**. The app fetches EVE's official Static Data Export (about 100 MB, one-off)
@@ -38,6 +39,11 @@ Each group has a header with a progress bar. Click a header to collapse or expan
 Ship groups follow the in-game ship tree (frigates → destroyers → cruisers → battlecruisers →
 battleships → capitals → industrial). Other groups are alphabetical. The ship order is a
 hand-made list in `src/data.rs` (`SHIP_TREE_ORDER`), because the game data doesn't include the tree layout.
+
+Outside ships and reactions, groups are sections of the in-game market tree, so related item groups share
+one header (e.g. light, heavy, auto-targeting and assault missiles all sit under **Missiles**). Each card
+still shows its own item group. Very broad market sections (`SPLIT_SECTIONS` in `src/data.rs`: Turrets &
+Launchers, Rigs, Components) are split one level deeper.
 
 **Ignore** removes a blueprint from your completion count, for example BPC-only items
 you don't count as part of the set.
@@ -79,10 +85,11 @@ This needs the repo's releases to be public. Keep the exe in a folder you own, l
 Desktop, rather than Program Files, so it's allowed to replace itself.
 
 ## Your data
-Saved automatically in `%APPDATA%\EVE BPO Tracker\`: `collection.json` (your progress), `bpos.json`
+Saved automatically in `%APPDATA%\Slipway\`: `collection.json` (your progress), `bpos.json`
 (blueprint list), `settings.json` (collapsed groups), `accounts.json`, `sync_details.json` and `jobs.json`
-(EVE logins, synced originals and industry jobs) and `icons\` (image cache from images.evetech.net). This is the same folder and
-format the earlier Python version used, so existing progress carries over.
+(EVE logins, synced originals and industry jobs) and `icons\` (image cache from images.evetech.net). If you used the app before the rename, the old
+`%APPDATA%\EVE BPO Tracker\` folder is moved here on first run, so existing progress carries over
+(including from the earlier Python version).
 Use *File › Back up collection* occasionally. *Export to CSV* gives you a spreadsheet.
 
 ## Notes
@@ -100,7 +107,7 @@ Use *File › Back up collection* occasionally. *Export to CSV* gives you a spre
 - `src/theme.rs`: Solus colours and fonts
 
 ## License
-The code is released under the [MIT License](LICENSE). Copyright © 2026 Solus Interactive.
+The code is released under the [MIT License](LICENSE). Copyright © 2026 Unanimus.
 
 This licence covers this project's own code only. The bundled Inter font is under the SIL Open Font License
 (`assets/fonts/OFL.txt`). Game data and images the app downloads from CCP (the SDE, ESI and

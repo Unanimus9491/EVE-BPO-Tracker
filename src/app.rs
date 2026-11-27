@@ -1,4 +1,4 @@
-//! The tracker window: tabs, filters, a virtualised card grid with group headers, and a detail panel.
+//! The main window: tabs, filters, a virtualised card grid with group headers, and a detail panel.
 
 use crate::data::{self, Collection, Edit, Entry, ME_MAX, Progress, TABS, TE_MAX};
 use crate::esi::{self, Account, SyncedOriginal};
@@ -131,7 +131,19 @@ impl TrackerApp {
         let coll = Collection::load(dir.join("collection.json"));
         let icons = Icons::new(dir.join("icons"), ctx);
         let mut app = Self {
-            dialog: if entries.is_empty() { Dialog::FirstRun } else { Dialog::None },
+            dialog: if entries.is_empty() {
+                Dialog::FirstRun
+            } else if entries.iter().all(|e| e.market_path.is_empty()) {
+                // Data built by an older version: no market tree, so groups can't be combined yet.
+                Dialog::Message {
+                    title: "Game data needs a refresh".into(),
+                    body: "Groups are now combined into broader sections (e.g. all missiles together), \
+                           which needs the game data rebuilt once.\n\nUse File › Download / update game data."
+                        .into(),
+                }
+            } else {
+                Dialog::None
+            },
             dir,
             entries,
             coll,
@@ -522,7 +534,7 @@ impl TrackerApp {
         let techs: BTreeSet<String> = self.entries.iter().map(|e| e.tech.clone()).collect();
         self.techs = techs.into_iter().collect();
         let groups: BTreeSet<String> =
-            self.entries.iter().filter(|e| self.in_tab(e)).map(|e| e.group.clone()).collect();
+            self.entries.iter().filter(|e| self.in_tab(e)).map(|e| e.section.clone()).collect();
         self.groups = groups.into_iter().collect();
         if self.f.group.as_ref().is_some_and(|g| !self.groups.contains(g)) {
             self.f.group = None;
@@ -539,10 +551,11 @@ impl TrackerApp {
             && !e.name.to_lowercase().contains(q)
             && !e.product_name.to_lowercase().contains(q)
             && !e.group.to_lowercase().contains(q)
+            && !e.section.to_lowercase().contains(q)
         {
             return false;
         }
-        if f.tech.as_ref().is_some_and(|t| *t != e.tech) || f.group.as_ref().is_some_and(|g| *g != e.group) {
+        if f.tech.as_ref().is_some_and(|t| *t != e.tech) || f.group.as_ref().is_some_and(|g| *g != e.section) {
             return false;
         }
         if (f.market == 1 && !e.market) || (f.market == 2 && e.market) {
@@ -588,8 +601,15 @@ impl TrackerApp {
         match self.f.sort {
             SORT_GROUP => idx.sort_by_cached_key(|i| {
                 let e = &self.entries[*i];
-                // Ships follow the in-game ship tree; other groups are alphabetical.
-                (e.category.to_lowercase(), data::group_rank(&e.category, &e.group), e.group.to_lowercase(), e.name.to_lowercase())
+                // Ships follow the in-game ship tree; other sections are alphabetical,
+                // with cards of the same item group kept together inside a section.
+                (
+                    e.category.to_lowercase(),
+                    data::group_rank(&e.category, &e.section),
+                    e.section.to_lowercase(),
+                    e.group.to_lowercase(),
+                    e.name.to_lowercase(),
+                )
             }),
             2 | 3 => {
                 let missing_first = self.f.sort == 2;
@@ -604,12 +624,12 @@ impl TrackerApp {
             if self.f.sort == SORT_GROUP {
                 let e = &self.entries[i];
                 let same = header.is_some_and(|h| {
-                    matches!(&self.items[h], Item::Header { group, category, .. } if *group == e.group && *category == e.category)
+                    matches!(&self.items[h], Item::Header { group, category, .. } if *group == e.section && *category == e.category)
                 });
                 if !same {
-                    let collapsed = self.collapsed.contains(&(e.category.clone(), e.group.clone()));
+                    let collapsed = self.collapsed.contains(&(e.category.clone(), e.section.clone()));
                     self.items.push(Item::Header {
-                        group: e.group.clone(),
+                        group: e.section.clone(),
                         category: e.category.clone(),
                         ids: Vec::new(),
                         collapsed,
@@ -757,7 +777,7 @@ impl TrackerApp {
                     }
                     ui.close();
                 }
-                if ui.button("About EVE BPO Tracker").clicked() {
+                if ui.button(format!("About {}", data::APP_NAME)).clicked() {
                     self.dialog = Dialog::About;
                     ui.close();
                 }
@@ -1342,7 +1362,7 @@ impl TrackerApp {
             "Makes: {}\n{} › {}\n{} · {}\nType ID {}",
             e.product_name,
             e.category,
-            e.group,
+            if e.section == e.group { e.group.clone() } else { format!("{} › {}", e.section, e.group) },
             e.tech,
             if e.market { "Market listed" } else { "Not on market" },
             e.id
@@ -1476,7 +1496,7 @@ impl TrackerApp {
                     "Your browser should have opened EVE's login page. Pick a character and approve access \
                      to its blueprints, then come back here.",
                 );
-                ui.label(RichText::new("The tracker only asks to read blueprints. It can't see or change anything else.").color(MUTED));
+                ui.label(RichText::new("Slipway only asks to read blueprints. It can't see or change anything else.").color(MUTED));
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.spinner();
@@ -1527,7 +1547,7 @@ impl TrackerApp {
                     ui.label(RichText::new("Game data needed").font(font_bold(17.0)));
                     ui.add_space(6.0);
                     ui.label(
-                        "The tracker needs the list of blueprints from EVE's official Static Data Export.\n\n\
+                        "Slipway needs the list of blueprints from EVE's official Static Data Export.\n\n\
                          Download it now? It's a one-off download of roughly 100 MB; only the blueprint list is kept.",
                     );
                     ui.add_space(10.0);
@@ -1616,9 +1636,10 @@ impl TrackerApp {
                         ui.label(RichText::new(data::APP_NAME).font(font_bold(18.0)));
                         ui.label(RichText::new(format!("v{}", data::VERSION)).font(font_bold(14.0)).color(GOLD));
                     });
-                    ui.label(RichText::new("by Solus Interactive").color(MUTED));
+                    ui.label(RichText::new(data::APP_TAGLINE).color(GOLD));
+                    ui.label(RichText::new("by Unanimus").color(MUTED));
                     ui.add_space(8.0);
-                    ui.label("Track your EVE Online blueprint original collection.");
+                    ui.label("Industry and blueprint tools for EVE Online.");
                     ui.add_space(6.0);
                     ui.label(RichText::new(format!("Data folder: {}", self.dir.display())).color(MUTED).font(font(11.5)));
                     ui.label(
