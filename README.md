@@ -1,6 +1,6 @@
 # Slipway: Industry & Blueprint Suite
 
-Industry and blueprint tools for EVE Online, starting with an AlecaFrame-style card grid for collecting
+Industry and blueprint tools for EVE Online, starting with a card grid for collecting
 every Blueprint Original (BPO). Formerly *EVE BPO Tracker*.
 It's a single Windows `.exe` written in Rust, and it doesn't need anything else installed.
 
