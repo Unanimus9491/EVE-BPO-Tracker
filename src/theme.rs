@@ -104,3 +104,158 @@ pub fn install(ctx: &egui::Context) {
         v.widgets.open.bg_stroke = Stroke::new(1.0, GOLD_PALE);
     });
 }
+
+// ----------------------------------------------------------------------------- card style
+/// The shape of cards, slots, buttons and panels. Chosen in Preferences, saved in settings.json.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CardStyle {
+    Rounded,
+    Chamfered,
+    Clipped,
+    Machined,
+}
+
+impl CardStyle {
+    pub const ALL: [CardStyle; 4] = [CardStyle::Rounded, CardStyle::Chamfered, CardStyle::Clipped, CardStyle::Machined];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CardStyle::Rounded => "Rounded",
+            CardStyle::Chamfered => "Chamfered",
+            CardStyle::Clipped => "Clipped",
+            CardStyle::Machined => "Machined",
+        }
+    }
+    pub fn blurb(self) -> &'static str {
+        match self {
+            CardStyle::Rounded => "Original",
+            CardStyle::Chamfered => "Default",
+            CardStyle::Clipped => "Two corners",
+            CardStyle::Machined => "Chamfer + bevel",
+        }
+    }
+    /// Name in settings.json.
+    pub fn key(self) -> &'static str {
+        match self {
+            CardStyle::Rounded => "rounded",
+            CardStyle::Chamfered => "chamfered",
+            CardStyle::Clipped => "clipped",
+            CardStyle::Machined => "machined",
+        }
+    }
+    pub fn from_key(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.key() == s)
+    }
+    pub fn industrial(self) -> bool {
+        self != CardStyle::Rounded
+    }
+}
+
+static STYLE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1); // Chamfered
+
+pub fn card_style() -> CardStyle {
+    CardStyle::ALL[STYLE.load(std::sync::atomic::Ordering::Relaxed) as usize % 4]
+}
+
+/// Switches the style and squares off egui's own widgets (dropdowns, text boxes, dialogs) to match.
+pub fn set_card_style(ctx: &egui::Context, style: CardStyle) {
+    let i = CardStyle::ALL.iter().position(|c| *c == style).unwrap_or(1) as u8;
+    STYLE.store(i, std::sync::atomic::Ordering::Relaxed);
+    let (widget, window) = if style.industrial() { (1, 2) } else { (6, 10) };
+    ctx.global_style_mut(|s| {
+        let v = &mut s.visuals;
+        v.window_corner_radius = CornerRadius::same(window);
+        v.menu_corner_radius = CornerRadius::same(widget);
+        for w in [
+            &mut v.widgets.noninteractive,
+            &mut v.widgets.inactive,
+            &mut v.widgets.hovered,
+            &mut v.widgets.active,
+            &mut v.widgets.open,
+        ] {
+            w.corner_radius = CornerRadius::same(widget);
+        }
+    });
+    ctx.request_repaint();
+}
+
+/// Corner radius for egui Frames (banners, note boxes) in the current style.
+pub fn frame_radius(rounded: u8) -> u8 {
+    if card_style().industrial() { 1 } else { rounded }
+}
+
+/// Outline of `r` in `style`: `radius` is used for Rounded, `cut` (the 45° corner) for the others.
+fn outline(style: CardStyle, r: egui::Rect, cut: f32) -> Vec<egui::Pos2> {
+    use egui::pos2;
+    let k = cut.min(r.width() / 2.0).min(r.height() / 2.0);
+    let (l, t, rt, b) = (r.left(), r.top(), r.right(), r.bottom());
+    match style {
+        CardStyle::Clipped => vec![pos2(l + k, t), pos2(rt, t), pos2(rt, b - k), pos2(rt - k, b), pos2(l, b), pos2(l, t + k)],
+        _ => vec![
+            pos2(l + k, t),
+            pos2(rt - k, t),
+            pos2(rt, t + k),
+            pos2(rt, b - k),
+            pos2(rt - k, b),
+            pos2(l + k, b),
+            pos2(l, b - k),
+            pos2(l, t + k),
+        ],
+    }
+}
+
+/// Fills a panel shape in the given style.
+pub fn shape_fill_as(style: CardStyle, p: &egui::Painter, r: egui::Rect, radius: f32, cut: f32, fill: Color32) {
+    if style == CardStyle::Rounded {
+        p.rect_filled(r, radius, fill);
+        return;
+    }
+    p.add(egui::Shape::convex_polygon(outline(style, r, cut), fill, Stroke::NONE));
+    if style == CardStyle::Machined && r.height() > 30.0 {
+        // faint machined highlight along the top edge
+        let y = r.top() + 1.5;
+        p.line_segment(
+            [egui::pos2(r.left() + cut, y), egui::pos2(r.right() - cut, y)],
+            Stroke::new(1.0, Color32::from_white_alpha(16)),
+        );
+    }
+}
+
+/// Draws a panel's border inside `r` in the given style.
+pub fn shape_stroke_as(style: CardStyle, p: &egui::Painter, r: egui::Rect, radius: f32, cut: f32, stroke: Stroke) {
+    if style == CardStyle::Rounded {
+        p.rect_stroke(r, radius, stroke, egui::StrokeKind::Inside);
+        return;
+    }
+    let h = stroke.width / 2.0;
+    // Shrinking the rect pulls the 45° edges in by h·√2 − h; trim the cut so the border stays parallel.
+    let pts = outline(style, r.shrink(h), (cut - h * (std::f32::consts::SQRT_2 - 1.0)).max(0.0));
+    p.add(egui::Shape::closed_line(pts, stroke));
+}
+
+pub fn shape_fill(p: &egui::Painter, r: egui::Rect, radius: f32, cut: f32, fill: Color32) {
+    shape_fill_as(card_style(), p, r, radius, cut, fill);
+}
+pub fn shape_stroke(p: &egui::Painter, r: egui::Rect, radius: f32, cut: f32, stroke: Stroke) {
+    shape_stroke_as(card_style(), p, r, radius, cut, stroke);
+}
+/// Fill + border in the current style.
+pub fn shape(p: &egui::Painter, r: egui::Rect, radius: f32, cut: f32, fill: Color32, stroke: Stroke) {
+    shape_fill(p, r, radius, cut, fill);
+    shape_stroke(p, r, radius, cut, stroke);
+}
+
+/// Card-sized cut and small-part cut, matching the mockup.
+pub const CUT: f32 = 12.0;
+pub const CUT_SMALL: f32 = 7.0;
+
+// ----------------------------------------------------------------------------- animations
+static ANIMATIONS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// The gold sweep on cards with running jobs. Turned off in Preferences.
+pub fn animations() -> bool {
+    ANIMATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+pub fn set_animations(on: bool) {
+    ANIMATIONS.store(on, std::sync::atomic::Ordering::Relaxed);
+}

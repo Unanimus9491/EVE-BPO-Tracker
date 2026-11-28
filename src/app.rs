@@ -8,7 +8,7 @@ use crate::icons::Icons;
 use crate::theme::*;
 use eframe::egui::{
     self, Align, Align2, Color32, CursorIcon, Layout, Pos2, Rect, RichText, Sense, Stroke,
-    StrokeKind, Ui, Vec2, pos2, vec2,
+    Ui, Vec2, pos2, vec2,
 };
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -19,6 +19,9 @@ const GAP: f32 = 10.0;
 const CELL_W: f32 = CARD_W + GAP;
 const CELL_H: f32 = CARD_H + GAP;
 const HEADER_H: f32 = 52.0;
+/// Collapsed groups are drawn as compact cards that flow in the same columns as blueprint cards.
+const GROUP_H: f32 = 96.0;
+const GROUP_CELL_H: f32 = GROUP_H + GAP;
 const SLOT_SIZE: f32 = 50.0;
 
 const STATUS: [&str; 10] = [
@@ -36,6 +39,11 @@ const STATUS: [&str; 10] = [
 const MARKET: [&str; 3] = ["Market + non-market", "Market listed only", "Not on market only"];
 const SORT: [&str; 4] = ["Sort: Name", "Sort: Group", "Sort: Missing first", "Sort: Owned first"];
 const SORT_GROUP: usize = 1;
+/// Tiers that normally only exist as copies (BPCs). Hidden by "Hide unobtainable" unless owned.
+const UNOBTAINABLE: [&str; 6] = ["Tech II", "Tech III", "Storyline", "Faction", "Officer", "Deadspace"];
+const BREADCRUMB_H: f32 = 76.0;
+/// Space after an expanded group's cards, with a divider, before the next group.
+const GROUP_END_H: f32 = 26.0;
 
 enum Item {
     Header { group: String, category: String, ids: Vec<u32>, collapsed: bool },
@@ -43,12 +51,15 @@ enum Item {
 }
 
 enum Row {
-    Header(usize),           // item index
+    Header(usize),           // item index (an expanded group)
     Cards(usize, usize),     // item range
+    Groups(usize, usize),    // item range of collapsed groups, shown as group cards
+    GroupEnd,                // divider closing an expanded group
 }
 
 enum Dialog {
     None,
+    Preferences,
     FirstRun,
     Message { title: String, body: String },
     ConfirmRestore(PathBuf),
@@ -67,9 +78,11 @@ struct Filters {
     market: usize,
     sort: usize,
     hide_ignored: bool,
-    /// Tech II BPOs essentially can't be obtained (only from rare events or dev gifts),
-    /// and Tech III only comes as reverse-engineered copies.
-    hide_t2_t3: bool,
+    /// Hide missing blueprints of tiers that normally only exist as copies (see UNOBTAINABLE).
+    /// Owned ones always show.
+    hide_unobtainable: bool,
+    /// The group (category, section) opened in "Open" mode; only its cards are shown.
+    inside: Option<(String, String)>,
     /// Characters whose synced blueprints are shown; None = everything (all characters + hand-ticked).
     chars: Option<BTreeSet<String>>,
 }
@@ -84,6 +97,13 @@ pub struct TrackerApp {
     /// Collapsed groups as (category, group); remembered between sessions in settings.json.
     collapsed: BTreeSet<(String, String)>,
     collapse_changed: bool,
+    /// Clicking a group card opens it (true) or expands it in place (false). Saved in settings.json.
+    open_groups: bool,
+    /// Card style read from settings.json, applied to the egui context once it's available.
+    loaded_style: CardStyle,
+    /// Scroll position of the group overview, restored when leaving a group.
+    overview_scroll: f32,
+    pending_scroll: Option<f32>,
     applied_rev: u64,
     items: Vec<Item>,
     shown: usize,
@@ -129,7 +149,7 @@ impl TrackerApp {
         let dir = data::data_dir();
         let entries = data::load_entries(&dir.join("bpos.json")).unwrap_or_default();
         let coll = Collection::load(dir.join("collection.json"));
-        let icons = Icons::new(dir.join("icons"), ctx);
+        let icons = Icons::new(dir.join("icons"), ctx.clone());
         let mut app = Self {
             dialog: if entries.is_empty() {
                 Dialog::FirstRun
@@ -157,12 +177,17 @@ impl TrackerApp {
                 market: 1, // most blueprints that aren't market listed can't be obtained as BPOs
                 sort: SORT_GROUP,
                 hide_ignored: true,
-                hide_t2_t3: true,
+                hide_unobtainable: true,
+                inside: None,
                 chars: None,
             },
             applied: None,
             collapsed: BTreeSet::new(),
             collapse_changed: false,
+            open_groups: true,
+            loaded_style: CardStyle::Chamfered,
+            overview_scroll: 0.0,
+            pending_scroll: None,
             applied_rev: 0,
             items: Vec::new(),
             shown: 0,
@@ -212,11 +237,27 @@ impl TrackerApp {
             if let Ok(c) = std::env::var("BPO_TEST_CHARS") {
                 app.f.chars = Some(c.split(',').map(str::to_string).collect());
             }
+            if std::env::var_os("BPO_TEST_EXPAND_MODE").is_some() {
+                app.open_groups = false;
+            }
+            if let Ok(v) = std::env::var("BPO_TEST_OPEN") {
+                // "Category/Group", e.g. "Module/Harvest Equipment"
+                if let Some((c, g)) = v.split_once('/') {
+                    app.f.inside = Some((c.into(), g.into()));
+                }
+            }
             if let Ok(g) = std::env::var("BPO_TEST_COLLAPSE") {
                 app.collapsed.insert(("Ship".into(), g));
             }
             app.test = Some(TestHook { out: out.into(), frame: 0, done: Default::default() });
         }
+        if let Ok(v) = std::env::var("BPO_TEST_STYLE") {
+            app.loaded_style = CardStyle::from_key(&v).unwrap_or(app.loaded_style);
+        }
+        if std::env::var_os("BPO_TEST_PREFS").is_some() {
+            app.dialog = Dialog::Preferences;
+        }
+        set_card_style(&ctx, app.loaded_style);
         app.refresh_options();
         app
     }
@@ -300,7 +341,7 @@ impl TrackerApp {
         egui::Frame::new()
             .fill(CHARCOAL)
             .stroke(Stroke::new(1.0, pale_gold_a(140)))
-            .corner_radius(8)
+            .corner_radius(frame_radius(8))
             .inner_margin(egui::Margin::symmetric(12, 8))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -485,16 +526,27 @@ impl TrackerApp {
         #[serde(default)]
         struct Settings {
             collapsed: Vec<(String, String)>,
+            open_groups: Option<bool>,
+            card_style: Option<String>,
+            animations: Option<bool>,
         }
         let s: Settings = std::fs::read_to_string(self.dir.join("settings.json"))
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default();
         self.collapsed = s.collapsed.into_iter().collect();
+        self.open_groups = s.open_groups.unwrap_or(true);
+        set_animations(s.animations.unwrap_or(true));
+        self.loaded_style = s.card_style.as_deref().and_then(CardStyle::from_key).unwrap_or(CardStyle::Chamfered);
     }
 
     fn save_settings(&self) {
-        let json = serde_json::json!({ "collapsed": self.collapsed.iter().collect::<Vec<_>>() });
+        let json = serde_json::json!({
+            "collapsed": self.collapsed.iter().collect::<Vec<_>>(),
+            "open_groups": self.open_groups,
+            "card_style": card_style().key(),
+            "animations": animations(),
+        });
         if let Ok(bytes) = serde_json::to_vec_pretty(&json) {
             let _ = data::atomic_write(&self.dir.join("settings.json"), &bytes);
         }
@@ -561,7 +613,10 @@ impl TrackerApp {
         if (f.market == 1 && !e.market) || (f.market == 2 && e.market) {
             return false;
         }
-        if self.hides_tech(e) {
+        if f.inside.as_ref().is_some_and(|(c, g)| *c != e.category || *g != e.section) {
+            return false;
+        }
+        if self.hides_unobtainable(e) {
             return false;
         }
         let s = &self.view_state(e.id);
@@ -621,13 +676,14 @@ impl TrackerApp {
         self.items.clear();
         let mut header: Option<usize> = None; // index of the current group's header in items
         for i in idx {
-            if self.f.sort == SORT_GROUP {
+            if self.f.sort == SORT_GROUP && self.f.inside.is_none() {
                 let e = &self.entries[i];
                 let same = header.is_some_and(|h| {
                     matches!(&self.items[h], Item::Header { group, category, .. } if *group == e.section && *category == e.category)
                 });
                 if !same {
-                    let collapsed = self.collapsed.contains(&(e.category.clone(), e.section.clone()));
+                    let collapsed =
+                        self.open_groups || self.collapsed.contains(&(e.category.clone(), e.section.clone()));
                     self.items.push(Item::Header {
                         group: e.section.clone(),
                         category: e.category.clone(),
@@ -655,6 +711,17 @@ impl TrackerApp {
         let mut i = 0;
         while i < self.items.len() {
             match self.items[i] {
+                Item::Header { collapsed: true, .. } => {
+                    let start = i;
+                    while i < self.items.len()
+                        && i - start < cols
+                        && matches!(self.items[i], Item::Header { collapsed: true, .. })
+                    {
+                        i += 1;
+                    }
+                    rows.push((Row::Groups(start, i), y, GROUP_CELL_H));
+                    y += GROUP_CELL_H;
+                }
                 Item::Header { .. } => {
                     rows.push((Row::Header(i), y, HEADER_H));
                     y += HEADER_H;
@@ -667,6 +734,11 @@ impl TrackerApp {
                     }
                     rows.push((Row::Cards(start, i), y, CELL_H));
                     y += CELL_H;
+                    // An expanded group's cards end here and another group follows.
+                    if matches!(self.items.get(i), Some(Item::Header { .. })) {
+                        rows.push((Row::GroupEnd, y, GROUP_END_H));
+                        y += GROUP_END_H;
+                    }
                 }
             }
         }
@@ -761,6 +833,10 @@ impl TrackerApp {
                         self.dialog = Dialog::ConfirmRestore(p);
                     }
                 ui.separator();
+                if ui.add(egui::Button::new("Preferences…").shortcut_text("Ctrl+,")).clicked() {
+                    self.dialog = Dialog::Preferences;
+                }
+                ui.separator();
                 if ui.button("Open data folder").clicked() {
                     self.open_data_folder();
                 }
@@ -820,11 +896,10 @@ impl TrackerApp {
         self.f.chars.is_some()
     }
 
-    /// Hidden as Tech II/III, unless the tech filter explicitly asks for that tech level.
-    fn hides_tech(&self, e: &Entry) -> bool {
-        self.f.hide_t2_t3
-            && (e.tech == "Tech II" || e.tech == "Tech III")
-            && self.f.tech.as_deref() != Some(e.tech.as_str())
+    /// Hidden by "Hide unobtainable": a missing blueprint of a tier that normally only exists
+    /// as copies. Owned ones always show.
+    fn hides_unobtainable(&self, e: &Entry) -> bool {
+        self.f.hide_unobtainable && UNOBTAINABLE.contains(&e.tech.as_str()) && !self.view_state(e.id).owned
     }
 
     fn stats_text(&self) -> (usize, usize, usize) {
@@ -835,7 +910,7 @@ impl TrackerApp {
             2 => !e.market,
             _ => true,
         };
-        for e in self.entries.iter().filter(|e| self.in_tab(e) && market_ok(e) && !self.hides_tech(e)) {
+        for e in self.entries.iter().filter(|e| self.in_tab(e) && market_ok(e) && !self.hides_unobtainable(e)) {
             let s = self.view_state(e.id);
             if s.ignored {
                 continue;
@@ -904,20 +979,18 @@ impl TrackerApp {
         ui.horizontal(|ui| {
             for (i, name) in TABS.iter().enumerate() {
                 let on = self.f.tab == i;
-                let text = RichText::new(*name).font(if on { font_bold(13.5) } else { font(13.5) });
-                let btn = egui::Button::new(text.color(if on { GROUND } else { TEXT }))
-                    .fill(if on { GOLD } else { CHARCOAL })
-                    .stroke(Stroke::new(1.0, if on { GOLD } else { BORDER }))
-                    .corner_radius(6)
-                    .min_size(vec2(0.0, 30.0));
-                if ui.add(btn).clicked() {
+                if shaped_button(ui, name, on, 30.0).clicked() && self.f.tab != i {
                     self.f.tab = i;
+                    self.leave_group();
                 }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.f.search)
-                        .hint_text("Search blueprint or product…")
+                        .hint_text(match &self.f.inside {
+                            Some((_, g)) => format!("Search in {g}…"),
+                            None => "Search blueprint or product…".to_string(),
+                        })
                         .desired_width(260.0)
                         .margin(vec2(8.0, 6.0)),
                 );
@@ -928,13 +1001,16 @@ impl TrackerApp {
         // filters (wrap onto a second line in narrow windows)
         ui.horizontal_wrapped(|ui| {
             combo(ui, "status", 150.0, &mut self.f.status, &STATUS);
-            let tech_label = self.f.tech.clone().unwrap_or_else(|| "Any tech".into());
-            egui::ComboBox::from_id_salt("tech").width(100.0).selected_text(tech_label).show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.f.tech, None, "Any tech");
-                for t in &self.techs {
-                    ui.selectable_value(&mut self.f.tech, Some(t.clone()), t);
-                }
-            });
+            // With unobtainable tiers hidden only Tech I is left, so the tech filter is hidden too.
+            if !self.f.hide_unobtainable {
+                let tech_label = self.f.tech.clone().unwrap_or_else(|| "Any tech".into());
+                egui::ComboBox::from_id_salt("tech").width(100.0).selected_text(tech_label).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.f.tech, None, "Any tech");
+                    for t in &self.techs {
+                        ui.selectable_value(&mut self.f.tech, Some(t.clone()), t);
+                    }
+                });
+            }
             let group_label = self.f.group.clone().unwrap_or_else(|| "Any group".into());
             egui::ComboBox::from_id_salt("group").width(160.0).height(400.0).selected_text(group_label).show_ui(
                 ui,
@@ -948,20 +1024,27 @@ impl TrackerApp {
             combo(ui, "market", 150.0, &mut self.f.market, &MARKET);
             combo(ui, "sort", 120.0, &mut self.f.sort, &SORT);
             if self.f.sort == SORT_GROUP {
-                if ui.button("Expand all").clicked() {
+                self.click_group_switch(ui);
+            }
+            if self.f.sort == SORT_GROUP && !self.open_groups && self.f.inside.is_none() {
+                if shaped_button(ui, "Expand all", false, 26.0).clicked() {
                     let keys = self.visible_group_keys();
                     self.set_collapsed(keys, false);
                 }
-                if ui.button("Collapse all").clicked() {
+                if shaped_button(ui, "Collapse all", false, 26.0).clicked() {
                     let keys = self.visible_group_keys();
                     self.set_collapsed(keys, true);
                 }
             }
             ui.checkbox(&mut self.f.hide_ignored, "Hide ignored");
-            ui.checkbox(&mut self.f.hide_t2_t3, "Hide Tech II/III").on_hover_text(
-                "Tech II BPOs can't normally be obtained (only from rare events or dev gifts), \
-                 and Tech III only comes as reverse-engineered copies",
+            let was = self.f.hide_unobtainable;
+            ui.checkbox(&mut self.f.hide_unobtainable, "Hide unobtainable").on_hover_text(
+                "Tech II, Tech III, Storyline, Faction, Officer and Deadspace blueprints normally only \
+                 exist as copies (BPCs), apart from rare event or legacy BPOs. Ones you own always show.",
             );
+            if self.f.hide_unobtainable && !was {
+                self.f.tech = None; // the tech filter is hidden now, so don't leave it applied
+            }
         });
         ui.add_space(6.0);
     }
@@ -977,6 +1060,10 @@ impl TrackerApp {
             return;
         }
         self.animating = false;
+        if self.f.inside.is_some() {
+            self.breadcrumb(ui);
+            ui.add_space(8.0);
+        }
         let width = ui.available_width();
         let cols = ((width + 2.0) / CELL_W).floor().max(1.0) as usize;
         let rows = self.layout_rows(cols);
@@ -984,9 +1071,15 @@ impl TrackerApp {
         let mut edits: Vec<(u32, Edit)> = Vec::new();
         let mut select: Option<u32> = None;
         let mut toggle: Option<((String, String), bool)> = None;
+        let mut open: Option<(String, String)> = None;
+        let mut group_anim = false;
         let shift = ui.input(|i| i.modifiers.shift);
 
-        egui::ScrollArea::vertical().auto_shrink(false).wheel_scroll_multiplier(vec2(1.0, 1.6)).show_viewport(
+        let mut scroll = egui::ScrollArea::vertical().auto_shrink(false).wheel_scroll_multiplier(vec2(1.0, 1.6));
+        if let Some(y) = self.pending_scroll.take() {
+            scroll = scroll.vertical_scroll_offset(y);
+        }
+        let out = scroll.show_viewport(
             ui,
             |ui, viewport| {
                 ui.set_height(total_h);
@@ -1001,6 +1094,30 @@ impl TrackerApp {
                                 let rect = Rect::from_min_size(origin + vec2(0.0, *y), vec2(cols as f32 * CELL_W, HEADER_H));
                                 if self.header(ui, rect, group, category, ids, *collapsed) {
                                     toggle = Some(((category.clone(), group.clone()), !*collapsed));
+                                }
+                            }
+                        }
+                        Row::GroupEnd => {
+                            let left = origin.x + GAP / 2.0 + 2.0;
+                            let right = origin.x + cols as f32 * CELL_W - GAP / 2.0 - 2.0;
+                            paint_divider(ui.painter(), left, right, origin.y + y + GROUP_END_H / 2.0);
+                        }
+                        Row::Groups(a, b) => {
+                            for (col, item) in (*a..*b).enumerate() {
+                                if let Item::Header { group, category, ids, .. } = &self.items[item] {
+                                    let rect = Rect::from_min_size(
+                                        origin + vec2(col as f32 * CELL_W + GAP / 2.0, y + GAP / 2.0),
+                                        vec2(CARD_W, GROUP_H),
+                                    );
+                                    let (clicked, anim) = self.group_card(ui, rect, group, category, ids);
+                                    group_anim |= anim;
+                                    if clicked {
+                                        if self.open_groups {
+                                            open = Some((category.clone(), group.clone()));
+                                        } else {
+                                            toggle = Some(((category.clone(), group.clone()), false));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1019,6 +1136,16 @@ impl TrackerApp {
                 }
             },
         );
+        if group_anim {
+            self.animating = true;
+        }
+        if self.f.inside.is_none() {
+            self.overview_scroll = out.state.clamped_offset().y;
+        }
+        if let Some(key) = open {
+            self.f.inside = Some(key);
+            self.pending_scroll = Some(0.0);
+        }
         for (id, edit) in edits {
             self.coll.edit(id, edit);
         }
@@ -1070,11 +1197,123 @@ impl TrackerApp {
             count += &format!("  ·  {full} researched");
         }
         p.text(pos2(bar.left() - 12.0, mid), Align2::RIGHT_CENTER, count, font_bold(12.5), if complete { GOLD } else { MUTED });
-        // divider with a short gold lead-in
-        let base = r.bottom() - 8.0;
-        p.rect_filled(Rect::from_min_size(pos2(r.left(), base), vec2(r.width(), 1.0)), 0, BORDER);
-        p.rect_filled(Rect::from_min_size(pos2(r.left(), base - 1.0), vec2(36.0, 3.0)), 1, GOLD);
+        paint_divider(p, r.left(), r.right(), r.bottom() - 8.0);
         resp.clicked()
+    }
+
+    /// Draws a collapsed group as a card with a progress dial; returns true when clicked (to expand).
+    /// Returns (clicked, animating).
+    fn group_card(&self, ui: &mut Ui, rect: Rect, group: &str, category: &str, ids: &[u32]) -> (bool, bool) {
+        let resp = ui
+            .interact(rect, ui.scope_id().with(("group", category, group)), Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text(if self.open_groups { "Click to open" } else { "Click to expand" });
+        let total = ids.len();
+        let states: Vec<_> = ids.iter().map(|i| self.view_state(*i)).collect();
+        let owned = states.iter().filter(|s| s.owned).count();
+        let full = states.iter().filter(|s| s.fully_researched()).count();
+        let complete = total > 0 && owned == total;
+        let frac = |n: usize| if total == 0 { 0.0 } else { n as f32 / total as f32 };
+
+        let p = ui.painter_at(rect.expand(2.0));
+        let border = if complete {
+            GOLD
+        } else if resp.hovered() {
+            Color32::from_rgb(0x4a, 0x44, 0x3e)
+        } else {
+            BORDER
+        };
+        shape_fill(&p, rect, 10.0, CUT, if owned > 0 { CARD_OWNED } else { CHARCOAL });
+        // Same sweep as blueprint cards while any blueprint in the group is being ME/TE researched.
+        let now = esi::now_unix();
+        let researching = animations()
+            && ids.iter().any(|id| {
+                self.jobs_for(*id).iter().any(|j| {
+                    j.is_running(now) && matches!(j.activity, esi::Activity::MeResearch | esi::Activity::TeResearch)
+                })
+            });
+        if researching {
+            let t = ui.input(|i| i.time) as f32 + if self.test.is_some() { 2.6 } else { 0.0 };
+            paint_sweep(&ui.painter_at(rect.shrink(1.0)), rect, t);
+        }
+        shape_stroke(&p, rect, 10.0, CUT, Stroke::new(if complete { 2.0 } else { 1.2 }, border));
+
+        let c = pos2(rect.left() + 16.0 + DIAL_R, rect.center().y);
+        paint_dial(&p, c, frac(owned), frac(full), complete);
+
+        // text
+        let tx = c.x + DIAL_R + 18.0;
+        let tw = rect.right() - tx - 12.0;
+        let title_color = if resp.hovered() { GOLD_PALE } else { TEXT };
+        let name = elide(&p, group, font_bold(15.0), tw);
+        p.text(pos2(tx, rect.top() + 24.0), Align2::LEFT_CENTER, name, font_bold(15.0), title_color);
+        p.text(pos2(tx, rect.top() + 43.0), Align2::LEFT_CENTER, category.to_uppercase(), font(10.5), MUTED);
+        paint_legend(&p, pos2(tx, rect.bottom() - 33.0), owned, total, full);
+        (resp.clicked(), researching)
+    }
+
+    /// The bar shown above an opened group: Back, where you are, and the group's progress.
+    fn breadcrumb(&mut self, ui: &mut Ui) {
+        let Some((category, group)) = self.f.inside.clone() else { return };
+        let ids: Vec<u32> = self
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                Item::Card(ei) => Some(self.entries[*ei].id),
+                _ => None,
+            })
+            .collect();
+        let states: Vec<_> = ids.iter().map(|i| self.view_state(*i)).collect();
+        let total = ids.len();
+        let owned = states.iter().filter(|s| s.owned).count();
+        let full = states.iter().filter(|s| s.fully_researched()).count();
+        let frac = |n: usize| if total == 0 { 0.0 } else { n as f32 / total as f32 };
+
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width() - 8.0, BREADCRUMB_H), Sense::hover());
+        let p = ui.painter_at(rect.expand(2.0));
+        shape(&p, rect, 10.0, CUT, CHARCOAL, Stroke::new(1.0, BORDER));
+
+        let back_r = Rect::from_min_size(pos2(rect.left() + 14.0, rect.center().y - 16.0), vec2(84.0, 32.0));
+        let back = ui
+            .interact(back_r, ui.scope_id().with("back"), Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text("Back to all groups (Esc)");
+        let hot = back.hovered();
+        shape(&p, back_r, 7.0, CUT_SMALL, SLOT, Stroke::new(1.0, if hot { GOLD_PALE } else { SLOT_BORDER }));
+        p.text(back_r.center(), Align2::CENTER_CENTER, "← Back", font_bold(13.5), if hot { GOLD_PALE } else { TEXT });
+
+        let tab = if self.f.tab == 0 { category.as_str() } else { TABS[self.f.tab] };
+        let crumb = p.text(pos2(back_r.right() + 16.0, rect.center().y + 1.0), Align2::LEFT_CENTER, format!("{tab} ›"), font(13.0), MUTED);
+        p.text(pos2(crumb.right() + 6.0, rect.center().y), Align2::LEFT_CENTER, &group, font_bold(18.0), TEXT);
+
+        let c = pos2(rect.right() - 18.0 - DIAL_R, rect.center().y);
+        paint_dial(&p, c, frac(owned), frac(full), total > 0 && owned == total);
+        paint_legend(&p, pos2(c.x - DIAL_R - 150.0, rect.center().y - 9.0), owned, total, full);
+
+        if back.clicked() {
+            self.leave_group();
+        }
+    }
+
+    fn leave_group(&mut self) {
+        if self.f.inside.take().is_some() {
+            self.pending_scroll = Some(self.overview_scroll);
+        }
+    }
+
+    /// "Click group: Expand | Open" switch.
+    fn click_group_switch(&mut self, ui: &mut Ui) {
+        ui.label(RichText::new("Click group").color(MUTED));
+        for (label, open) in [("Expand", false), ("Open", true)] {
+            let on = self.open_groups == open;
+            let hint = if open { "Clicking a group shows only its blueprints" } else { "Clicking a group expands it in place" };
+            if shaped_button(ui, label, on, 26.0).on_hover_text(hint).clicked() && !on {
+                self.open_groups = open;
+                self.leave_group();
+                self.collapse_changed = true;
+                self.save_settings();
+            }
+        }
     }
 
     fn slot(
@@ -1094,8 +1333,7 @@ impl TrackerApp {
         } else {
             (SLOT, SLOT_BORDER)
         };
-        p.rect_filled(r, 9, bg);
-        p.rect_stroke(r, 9, Stroke::new(1.4, border), StrokeKind::Inside);
+        shape(p, r, 9.0, CUT_SMALL, bg, Stroke::new(1.4, border));
         p.text(pos2(r.center().x, r.top() + 10.0), Align2::CENTER_CENTER, label, font(10.5), if lit || maxed { TEXT } else { MUTED });
         let vc = if maxed { GOLD } else if lit { TEXT } else { MUTED };
         // Shrink long values like "10→20" so they stay clear of the slot edges.
@@ -1115,8 +1353,7 @@ impl TrackerApp {
             let g = p.layout_no_wrap(b, font_bold(11.0), TEXT);
             let w = g.size().x + 10.0;
             let br = Rect::from_min_size(pos2(r.right() - w + 5.0, r.top() - 6.0), vec2(w, 16.0));
-            p.rect_filled(br, 5, Color32::from_rgb(0x0d, 0x0c, 0x0b));
-            p.rect_stroke(br, 5, Stroke::new(1.0, SLOT_BORDER), StrokeKind::Inside);
+            shape(p, br, 5.0, 4.0, Color32::from_rgb(0x0d, 0x0c, 0x0b), Stroke::new(1.0, SLOT_BORDER));
             p.galley(br.center() - g.size() / 2.0, g, TEXT);
         }
     }
@@ -1214,12 +1451,12 @@ impl TrackerApp {
         } else {
             BORDER
         };
-        p.rect_filled(rect, 10, if s.owned { CARD_OWNED } else { CHARCOAL });
-        if running {
+        shape_fill(&p, rect, 10.0, CUT, if s.owned { CARD_OWNED } else { CHARCOAL });
+        if running && animations() {
             paint_sweep(&ui.painter_at(rect.shrink(1.0)), rect, anim_t);
             self.animating = true;
         }
-        p.rect_stroke(rect, 10, Stroke::new(if selected || researched { 2.0 } else { 1.2 }, border), StrokeKind::Inside);
+        shape_stroke(&p, rect, 10.0, CUT, Stroke::new(if selected || researched { 2.0 } else { 1.2 }, border));
 
         // header
         p.text(star_r.center(), Align2::CENTER_CENTER, if s.fav { "★" } else { "☆" }, font(17.0), if s.fav { GOLD } else { MUTED });
@@ -1233,7 +1470,7 @@ impl TrackerApp {
         if let Some(tex) = tex {
             p.image(tex, img_r, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
         } else {
-            p.rect_filled(img_r, 8, Color32::from_black_alpha(60));
+            shape_fill(&p, img_r, 8.0, 8.0, Color32::from_black_alpha(60));
             let initials: String = e.short_name().split_whitespace().take(2).filter_map(|w| w.chars().next()).collect();
             p.text(img_r.center(), Align2::CENTER_CENTER, initials.to_uppercase(), font_bold(14.0), MUTED);
         }
@@ -1353,7 +1590,7 @@ impl TrackerApp {
             if let Some(t) = self.icons.get(&e) {
                 ui.painter().image(t.id(), r, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
             } else {
-                ui.painter().rect_filled(r, 10, Color32::from_black_alpha(60));
+                shape_fill(ui.painter(), r, 10.0, CUT, Color32::from_black_alpha(60));
             }
         });
         ui.add_space(8.0);
@@ -1382,7 +1619,7 @@ impl TrackerApp {
         if !jobs.is_empty() {
             let now = esi::now_unix();
             ui.label(RichText::new("In industry").font(font_bold(14.0)));
-            egui::Frame::new().fill(GROUND).corner_radius(6).inner_margin(8).show(ui, |ui| {
+            egui::Frame::new().fill(GROUND).corner_radius(frame_radius(6)).inner_margin(8).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 for j in &jobs {
                     let levels = match (j.activity, j.from_level, j.to_level()) {
@@ -1408,7 +1645,7 @@ impl TrackerApp {
         if !list.is_empty() {
             let total: u32 = list.iter().map(|d| d.count).sum();
             ui.label(RichText::new(format!("In EVE: {total} original{}", if total == 1 { "" } else { "s" })).font(font_bold(14.0)));
-            egui::Frame::new().fill(GROUND).corner_radius(6).inner_margin(8).show(ui, |ui| {
+            egui::Frame::new().fill(GROUND).corner_radius(frame_radius(6)).inner_margin(8).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 egui::Grid::new("originals").num_columns(3).spacing([10.0, 4.0]).show(ui, |ui| {
                     for (i, d) in list.iter().enumerate() {
@@ -1628,6 +1865,55 @@ impl TrackerApp {
                 }
                 close = r.inner || r.should_close();
             }
+            Dialog::Preferences => {
+                let mut picked = None;
+                let mut anim_changed = None;
+                let r = egui::Modal::new(egui::Id::unique("prefs")).show(ctx, |ui| {
+                    ui.set_width(560.0);
+                    ui.label(RichText::new("Preferences").font(font_bold(18.0)));
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("APPEARANCE").font(font_bold(11.0)).color(MUTED));
+                    ui.label(RichText::new("Card style: the shape of cards, slots, buttons and panels.").color(MUTED));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        for style in CardStyle::ALL {
+                            if style_tile(ui, style, card_style() == style).clicked() {
+                                picked = Some(style);
+                            }
+                        }
+                    });
+                    ui.add_space(12.0);
+                    let mut anim = animations();
+                    if ui
+                        .checkbox(&mut anim, "Animations")
+                        .on_hover_text(
+                            "Gold sweep on blueprint cards with running jobs, and on group cards \
+                             while one of their blueprints is being ME/TE researched",
+                        )
+                        .changed()
+                    {
+                        anim_changed = Some(anim);
+                    }
+                    ui.add_space(12.0);
+                    let mut close = false;
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Saved automatically.").color(MUTED).font(font(12.0)));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            close = shaped_button(ui, "Close", false, 28.0).clicked();
+                        });
+                    });
+                    close
+                });
+                if let Some(style) = picked {
+                    set_card_style(ctx, style);
+                    self.save_settings();
+                }
+                if let Some(on) = anim_changed {
+                    set_animations(on);
+                    self.save_settings();
+                }
+                close = r.inner || r.should_close();
+            }
             Dialog::About => {
                 let mut open_folder = false;
                 let r = egui::Modal::new(egui::Id::unique("about")).show(ctx, |ui| {
@@ -1749,6 +2035,19 @@ impl eframe::App for TrackerApp {
         self.poll_build();
         self.poll_esi();
         self.poll_updates();
+        if matches!(self.dialog, Dialog::None)
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma))
+        {
+            self.dialog = Dialog::Preferences;
+        }
+        if self.f.inside.is_some() && matches!(self.dialog, Dialog::None) {
+            let back = ctx.input(|i| {
+                i.key_pressed(egui::Key::Escape) || i.pointer.button_pressed(egui::PointerButton::Extra1)
+            });
+            if back {
+                self.leave_group();
+            }
+        }
         self.refilter_if_needed(false);
 
         egui::Panel::top("menu").show(ui, |ui| self.menu_bar(ui));
@@ -1836,6 +2135,127 @@ fn now_hhmm() -> String {
 }
 
 /// A soft diagonal band of light that sweeps across a card while one of its jobs is running.
+/// Divider line with a short gold lead-in, as under group headers. `y` is the line's top.
+fn paint_divider(p: &egui::Painter, left: f32, right: f32, y: f32) {
+    let style = card_style();
+    if style == CardStyle::Machined {
+        let mut x = left;
+        while x < right {
+            p.rect_filled(Rect::from_min_max(pos2(x, y), pos2((x + 8.0).min(right), y + 1.0)), 0, BORDER);
+            x += 12.0;
+        }
+    } else {
+        p.rect_filled(Rect::from_min_size(pos2(left, y), vec2(right - left, 1.0)), 0, BORDER);
+    }
+    if style.industrial() {
+        // lead-in with an angled end
+        let pts = vec![pos2(left, y - 1.0), pos2(left + 36.0, y - 1.0), pos2(left + 33.0, y + 2.0), pos2(left, y + 2.0)];
+        p.add(egui::Shape::convex_polygon(pts, GOLD, Stroke::NONE));
+    } else {
+        p.rect_filled(Rect::from_min_size(pos2(left, y - 1.0), vec2(36.0, 3.0)), 1, GOLD);
+    }
+}
+
+/// Legend marker: a dot, or a small diamond in the industrial styles.
+fn paint_marker(p: &egui::Painter, c: Pos2, color: Color32) {
+    if card_style().industrial() {
+        let d = 4.2;
+        p.add(egui::Shape::convex_polygon(
+            vec![c + vec2(0.0, -d), c + vec2(d, 0.0), c + vec2(0.0, d), c + vec2(-d, 0.0)],
+            color,
+            Stroke::NONE,
+        ));
+    } else {
+        p.circle_filled(c, 4.0, color);
+    }
+}
+
+/// One choice in Preferences › Card style: a small preview drawn in that style, and its name.
+fn style_tile(ui: &mut Ui, style: CardStyle, selected: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(128.0, 112.0), Sense::click());
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    let p = ui.painter();
+    let pv = Rect::from_min_size(rect.min, vec2(rect.width(), 76.0));
+    let border = if selected {
+        Stroke::new(2.0, GOLD)
+    } else if resp.hovered() {
+        Stroke::new(1.0, Color32::from_rgb(0x5a, 0x53, 0x4c))
+    } else {
+        Stroke::new(1.0, BORDER)
+    };
+    shape_fill_as(style, p, pv, 8.0, 8.0, CHARCOAL);
+    shape_stroke_as(style, p, pv, 8.0, 8.0, border);
+    let mini = Rect::from_center_size(pv.center(), vec2(84.0, 44.0));
+    shape_fill_as(style, p, mini, 8.0, 8.0, CARD_OWNED);
+    shape_stroke_as(style, p, mini, 8.0, 8.0, Stroke::new(1.2, pale_gold_a(130)));
+    p.text(pos2(rect.center().x, pv.bottom() + 14.0), Align2::CENTER_CENTER, style.label(), font_bold(13.0), if selected { GOLD } else { TEXT });
+    p.text(pos2(rect.center().x, pv.bottom() + 30.0), Align2::CENTER_CENTER, style.blurb(), font(11.5), MUTED);
+    resp
+}
+
+/// A toolbar/tab button drawn in the current card style. `on` = selected (gold).
+fn shaped_button(ui: &mut Ui, label: &str, on: bool, height: f32) -> egui::Response {
+    let color = if on { GROUND } else { TEXT };
+    let galley = ui.painter().layout_no_wrap(label.to_string(), if on { font_bold(13.5) } else { font(13.5) }, color);
+    let size = vec2(galley.size().x + 22.0, height.max(galley.size().y + 10.0));
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let border = if on {
+        GOLD
+    } else if resp.hovered() {
+        GOLD_PALE
+    } else {
+        BORDER
+    };
+    shape(ui.painter(), rect, 6.0, CUT_SMALL, if on { GOLD } else { CHARCOAL }, Stroke::new(1.0, border));
+    ui.painter().galley(rect.center() - galley.size() / 2.0, galley, color);
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
+const DIAL_R: f32 = 30.0;
+const DIAL_INNER_R: f32 = 21.0;
+
+/// Progress dial: outer ring = owned (pale gold), inner ring = fully researched (gold), % owned in the middle.
+fn paint_dial(p: &egui::Painter, c: Pos2, owned: f32, full: f32, complete: bool) {
+    p.circle_stroke(c, DIAL_R, Stroke::new(6.0, SLOT));
+    paint_arc(p, c, DIAL_R, owned, Stroke::new(6.0, GOLD_PALE));
+    p.circle_stroke(c, DIAL_INNER_R, Stroke::new(4.0, SLOT));
+    paint_arc(p, c, DIAL_INNER_R, full, Stroke::new(4.0, GOLD));
+    let pct = (owned * 100.0).floor() as u32;
+    p.text(c, Align2::CENTER_CENTER, format!("{pct}%"), font_bold(11.5), if complete { GOLD } else { TEXT });
+}
+
+/// "X / Y owned" and "N researched", each with a dot in its dial colour. `at` is the first line's left middle.
+fn paint_legend(p: &egui::Painter, at: Pos2, owned: usize, total: usize, full: usize) {
+    for (dy, color, text) in [
+        (0.0, GOLD_PALE, format!("{owned} / {total} owned")),
+        (18.0, GOLD, format!("{full} researched")),
+    ] {
+        paint_marker(p, at + vec2(4.0, dy), color);
+        p.text(at + vec2(14.0, dy), Align2::LEFT_CENTER, text, font_bold(12.0), MUTED);
+    }
+}
+
+/// A clockwise arc starting at 12 o'clock covering `frac` of a full circle.
+fn paint_arc(p: &egui::Painter, c: Pos2, r: f32, frac: f32, stroke: Stroke) {
+    let frac = frac.clamp(0.0, 1.0);
+    if frac <= 0.0 {
+        return;
+    }
+    if frac >= 1.0 {
+        p.circle_stroke(c, r, stroke);
+        return;
+    }
+    let n = ((96.0 * frac).ceil() as usize).max(2);
+    let a0 = -std::f32::consts::FRAC_PI_2;
+    let pts: Vec<Pos2> = (0..=n)
+        .map(|k| {
+            let a = a0 + std::f32::consts::TAU * frac * k as f32 / n as f32;
+            c + vec2(a.cos(), a.sin()) * r
+        })
+        .collect();
+    p.add(egui::Shape::line(pts, stroke));
+}
+
 fn paint_sweep(p: &egui::Painter, rect: Rect, t: f32) {
     let band = 140.0;
     let skew = 70.0;

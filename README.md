@@ -1,6 +1,6 @@
 # Slipway: Industry & Blueprint Suite
 
-Industry and blueprint tools for EVE Online, starting with a card grid for collecting
+Industry and blueprint tools for EVE Online, starting with an AlecaFrame-style card grid for collecting
 every Blueprint Original (BPO). Formerly *EVE BPO Tracker*.
 It's a single Windows `.exe` written in Rust, and it doesn't need anything else installed.
 
@@ -30,12 +30,16 @@ Each card is one blueprint and has three slots:
 The card lights up in pale gold when owned and gets a Solus Gold border at ME 10 / TE 20.
 Click ☆ to favourite. Right-click for more (copies, max research, ignore).
 The side panel edits the selected card, including notes.
-The grid opens sorted by group, showing **market-listed blueprints only** with **Tech II and III hidden**.
-Most blueprints that aren't market listed can't be obtained as originals, Tech II BPOs only come from
-rare events or dev gifts, and Tech III only comes as reverse-engineered copies. The owned totals follow
-these filters too. Untick **Hide Tech II/III** (or pick a tech level in the tech filter) to see them.
-Each group has a header with a progress bar. Click a header to collapse or expand it, or use
-**Expand all / Collapse all**. Collapsed groups are remembered between sessions.
+The grid opens sorted by group, showing **market-listed blueprints only** with **unobtainable tiers hidden**.
+Most blueprints that aren't market listed can't be obtained as originals, and Tech II, Tech III, Storyline,
+Faction, Officer and Deadspace blueprints normally only exist as copies (BPCs), apart from rare event or
+legacy BPOs. Any of those you own are always shown. The owned totals follow these filters too. Untick
+**Hide unobtainable** to see the rest (the tech filter appears when it's unticked).
+Each group is a card with a progress dial: the outer ring is owned, the inner ring fully researched.
+**Click group** sets what clicking a group card does. **Open** shows only that group's blueprints, with
+a Back button (or Esc / the mouse back button) to return. **Expand** opens it in place under a header,
+with **Expand all / Collapse all**; expanded groups are remembered between sessions.
+**File › Preferences…** (Ctrl+,) sets the card style: Rounded, Chamfered (default), Clipped or Machined.
 Ship groups follow the in-game ship tree (frigates → destroyers → cruisers → battlecruisers →
 battleships → capitals → industrial). Other groups are alphabetical. The ship order is a
 hand-made list in `src/data.rs` (`SHIP_TREE_ORDER`), because the game data doesn't include the tree layout.
@@ -86,7 +90,7 @@ Desktop, rather than Program Files, so it's allowed to replace itself.
 
 ## Your data
 Saved automatically in `%APPDATA%\Slipway\`: `collection.json` (your progress), `bpos.json`
-(blueprint list), `settings.json` (collapsed groups), `accounts.json`, `sync_details.json` and `jobs.json`
+(blueprint list), `settings.json` (expanded groups, the Click group setting and the card style), `accounts.json`, `sync_details.json` and `jobs.json`
 (EVE logins, synced originals and industry jobs) and `icons\` (image cache from images.evetech.net). If you used the app before the rename, the old
 `%APPDATA%\EVE BPO Tracker\` folder is moved here on first run, so existing progress carries over
 (including from the earlier Python version).

@@ -25,7 +25,7 @@ fn main() -> eframe::Result {
     updater::clean_up_old(); // remove the copy left behind by the last in-app update
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title(format!("{} {}", data::APP_NAME, data::VERSION))
+            .with_title(format!("{} - {} v{}", data::APP_NAME, data::APP_TAGLINE, data::VERSION))
             .with_inner_size([1500.0, 900.0])
             .with_min_inner_size([760.0, 520.0])
             .with_icon(Arc::new(window_icon())),
