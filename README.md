@@ -85,8 +85,10 @@ Characters menu, or revoke access at any time from the third-party applications 
 ## Updating
 From 0.4.0 on, the app checks GitHub for a newer release each time it starts. When there is one,
 a banner offers **Update and restart**: it downloads the new exe, swaps it in and reopens the app.
-You can also use **Help › Check for updates…**. The previous exe is kept as `….exe.old` until the
-next start, and nothing changes if the download fails.
+You can also use **Help › Check for updates…**. The previous exe is set aside as `….exe.old` and
+deleted automatically once the new version has started, and nothing changes if the download fails.
+A copy still named `EVE-BPO-Tracker.exe` installs the update as `Slipway.exe` in the same folder, so
+re-pin it if you had the old name pinned to the taskbar or Start menu.
 
 This needs the repo's releases to be public. Keep the exe in a folder you own, like Documents or
 Desktop, rather than Program Files, so it's allowed to replace itself.

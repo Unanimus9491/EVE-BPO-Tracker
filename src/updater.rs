@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex};
 
 pub const REPO: &str = "Unanimus9491/Slipway";
 pub const ASSET_NAME: &str = "Slipway.exe";
+/// The exe's name before the rename to Slipway. An update from a copy with this name installs as Slipway.exe.
+const LEGACY_EXE: &str = "EVE-BPO-Tracker.exe";
 
 pub fn releases_page() -> String {
     format!("https://github.com/{REPO}/releases/latest")
@@ -139,6 +141,13 @@ fn old_path(exe: &Path) -> PathBuf {
     exe.with_extension("exe.old")
 }
 
+/// Where an update gets installed: over the running exe, or as Slipway.exe beside it
+/// if the running copy still has the pre-rename name.
+fn target_for(exe: &Path) -> PathBuf {
+    let legacy = exe.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case(LEGACY_EXE));
+    if legacy { exe.with_file_name(ASSET_NAME) } else { exe.to_path_buf() }
+}
+
 fn download_and_swap(info: &UpdateInfo, st: &Shared, ctx: &eframe::egui::Context) -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| format!("Couldn't find the running app: {e}"))?;
     swap_in(&exe, info, &mut |done, total| {
@@ -150,10 +159,12 @@ fn download_and_swap(info: &UpdateInfo, st: &Shared, ctx: &eframe::egui::Context
     })
 }
 
-/// Downloads `info` and puts it at `exe`, keeping the previous file as `<exe>.old`.
+/// Downloads `info` and installs it (see `target_for`), keeping the running file as `<exe>.old`.
+/// Returns the path of the new exe to launch.
 fn swap_in(exe: &Path, info: &UpdateInfo, progress: &mut dyn FnMut(u64, u64)) -> Result<PathBuf, String> {
     let exe = exe.to_path_buf();
-    let new = exe.with_extension("exe.download");
+    let target = target_for(&exe);
+    let new = target.with_extension("exe.download");
 
     // 1. download next to the current exe (same drive, so the swap is a simple rename)
     let mut resp = ureq::get(&info.url)
@@ -200,12 +211,12 @@ fn swap_in(exe: &Path, info: &UpdateInfo, progress: &mut dyn FnMut(u64, u64)) ->
         let _ = std::fs::remove_file(&new);
         permission_hint(e, &exe)
     })?;
-    if let Err(e) = std::fs::rename(&new, &exe) {
+    if let Err(e) = std::fs::rename(&new, &target) {
         let _ = std::fs::rename(&old, &exe); // put things back
         let _ = std::fs::remove_file(&new);
         return Err(permission_hint(e, &exe));
     }
-    Ok(exe)
+    Ok(target)
 }
 
 fn permission_hint(e: std::io::Error, exe: &Path) -> String {
@@ -221,11 +232,25 @@ fn permission_hint(e: std::io::Error, exe: &Path) -> String {
 }
 
 /// Remove the copy left behind by the last update. Call at start-up.
+///
+/// Right after an update the previous copy is still closing and Windows keeps its file locked,
+/// so this keeps retrying in the background for up to 30 seconds.
 pub fn clean_up_old() {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::fs::remove_file(old_path(&exe));
-        let _ = std::fs::remove_file(exe.with_extension("exe.download"));
+    let Ok(exe) = std::env::current_exe() else { return };
+    let _ = std::fs::remove_file(exe.with_extension("exe.download")); // once only: an update may start soon
+    let mut left = vec![old_path(&exe)];
+    if let Some(dir) = exe.parent() {
+        left.push(old_path(&dir.join(LEGACY_EXE))); // after the update that renamed the exe
     }
+    std::thread::spawn(move || {
+        for _ in 0..60 {
+            left.retain(|p| p.exists() && std::fs::remove_file(p).is_err());
+            if left.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    });
 }
 
 /// Start the freshly installed exe. The caller then closes this one.
@@ -309,7 +334,25 @@ mod tests {
     }
 
     #[test]
+    fn renames_legacy_exe_on_update() {
+        let dir = std::env::temp_dir().join("bpo-test-update-legacy");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("EVE-BPO-Tracker.exe");
+        std::fs::write(&exe, b"MZ old version").unwrap();
+        let body = b"MZ new version!".to_vec();
+        let info = UpdateInfo { version: "9.9.9".into(), notes: String::new(), url: serve_once(body.clone()), size: body.len() as u64 };
+        let out = swap_in(&exe, &info, &mut |_, _| {}).unwrap();
+        assert_eq!(out, dir.join("Slipway.exe"), "installs under the new name");
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        assert!(!exe.exists(), "old name gone");
+        assert_eq!(std::fs::read(dir.join("EVE-BPO-Tracker.exe.old")).unwrap(), b"MZ old version");
+    }
+
+    #[test]
     fn swap_paths() {
+        assert_eq!(target_for(Path::new(r"C:\Tools\Slipway.exe")), Path::new(r"C:\Tools\Slipway.exe"));
+        assert_eq!(target_for(Path::new("eve-bpo-tracker.exe")), Path::new("Slipway.exe"));
         let exe = Path::new(r"C:\Tools\Slipway.exe");
         assert_eq!(old_path(exe), Path::new(r"C:\Tools\Slipway.exe.old"));
     }
