@@ -23,11 +23,7 @@ jobs:
         run: cargo build --release
 
       - name: Rename exe
-        # EVE-BPO-Tracker.exe is the same build under the pre-rename name, so copies
-        # installed before the rename can still find it through the in-app updater.
-        run: |
-          Copy-Item target/release/slipway.exe Slipway.exe
-          Copy-Item target/release/slipway.exe EVE-BPO-Tracker.exe
+        run: Copy-Item target/release/slipway.exe Slipway.exe
 
       - name: Upload exe
         uses: actions/upload-artifact@v4
@@ -39,6 +35,4 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            Slipway.exe
-            EVE-BPO-Tracker.exe
+          files: Slipway.exe
