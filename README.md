@@ -5,13 +5,16 @@ every Blueprint Original (BPO). Formerly *EVE BPO Tracker*.
 It's a single Windows `.exe` written in Rust, and it doesn't need anything else installed.
 
 ## Getting the exe
-GitHub Actions builds the exe every time you push to `main`:
+Download `Slipway.exe` from the latest [GitHub Release](https://github.com/Unanimus9491/Slipway/releases/latest).
 
-1. Open the repo's **Actions** tab and pick the latest **Build Windows exe** run.
-2. Download the **Slipway** artifact. It's a zip that contains `Slipway.exe`.
+GitHub Actions only builds when a version tag is pushed, or when you start it by hand:
 
-To publish a proper release, push a version tag (`git tag v0.2.0`, then `git push --tags`).
-The exe is then attached to a GitHub Release.
+- **Release:** push a version tag (`git tag v0.5.5`, then `git push origin v0.5.5`). The exe is built,
+  tested and attached to a GitHub Release, where the in-app updater finds it.
+- **Test build without releasing:** open the repo's **Actions** tab, pick **Build Windows exe** and click
+  **Run workflow**. When it finishes, download the **Slipway** artifact (a zip containing `Slipway.exe`).
+
+Pushing to `main` doesn't trigger a build, so test locally first (see below).
 
 ### Building it yourself
 Install Rust from https://rustup.rs, then run `cargo build --release` in this folder.
